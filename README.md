@@ -1,6 +1,58 @@
-# Node.js 后端开发学习笔记
+<div align="center">
+
+# 🚀 Node.js 后端开发学习笔记
+
+[![GitHub stars](https://img.shields.io/github/stars/cyrus0315/nodejs-backend-notes?style=social)](https://github.com/cyrus0315/nodejs-backend-notes/stargazers)
+[![GitHub forks](https://img.shields.io/github/forks/cyrus0315/nodejs-backend-notes?style=social)](https://github.com/cyrus0315/nodejs-backend-notes/network/members)
+[![GitHub issues](https://img.shields.io/github/issues/cyrus0315/nodejs-backend-notes)](https://github.com/cyrus0315/nodejs-backend-notes/issues)
+[![GitHub license](https://img.shields.io/github/license/cyrus0315/nodejs-backend-notes)](https://github.com/cyrus0315/nodejs-backend-notes/blob/main/LICENSE)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/cyrus0315/nodejs-backend-notes/pulls)
+
+**一份系统、实用的 Node.js 后端技术栈学习笔记** 📚
+
+涵盖 Node.js 核心、TypeScript、数据库、消息队列、框架、ORM、API 设计、安全、测试、AWS、DevOps、系统设计等
+
+[English](./README_EN.md) | 简体中文
+
+</div>
+
+---
+
+## ✨ 项目简介
 
 工作几年下来，发现很多知识点都是零散地学习的，没有系统地整理过。这个仓库是我重新梳理 Node.js 后端技术栈的一个过程，把平时用到的、看过的、踩过坑的东西都归纳一下，方便以后查阅。
+
+### 🎯 适合人群
+
+- 🌱 想系统学习 Node.js 后端开发的新手
+- 💼 需要快速查阅技术点的在职开发者
+- 📖 准备面试需要复习知识点的求职者
+- 🚀 想提升后端技术栈的全栈工程师
+
+### 🌟 项目特点
+
+- ✅ **系统全面**：覆盖 Node.js 后端开发的方方面面
+- ✅ **实战导向**：基于真实项目经验，包含大量实用示例
+- ✅ **持续更新**：根据工作实践不断补充新内容
+- ✅ **中文友好**：适合中文开发者阅读学习
+- ✅ **开箱即用**：代码示例可直接运行测试
+
+## 📑 目录
+
+- [✨ 项目简介](#-项目简介)
+- [📚 知识整理](#-知识整理)
+  - [语言和核心](#语言和核心)
+  - [数据存储](#数据存储)
+  - [框架和工具](#框架和工具)
+  - [API 开发](#api-开发)
+  - [云服务](#云服务)
+  - [基础巩固](#基础巩固)
+  - [架构设计](#架构设计)
+- [📝 使用说明](#-使用说明)
+- [💭 学习心得](#-学习心得)
+- [🤝 贡献指南](#-贡献指南)
+- [📄 许可证](#-许可证)
+- [⭐ Star History](#-star-history)
 
 ## 📚 知识整理
 
@@ -170,4 +222,42 @@
 
 ---
 
-**持续学习，慢慢积累。**
+## 🤝 贡献指南
+
+欢迎贡献！如果你有好的建议或发现了问题，请：
+
+1. 🐛 [提交 Issue](https://github.com/cyrus0315/nodejs-backend-notes/issues/new) 报告问题或提出建议
+2. 🔧 [提交 Pull Request](https://github.com/cyrus0315/nodejs-backend-notes/pulls) 贡献代码或内容
+3. ⭐ 给项目点个 Star 支持一下
+4. 🔀 Fork 项目，添加自己的笔记
+
+详细贡献指南请查看 [CONTRIBUTING.md](./CONTRIBUTING.md)
+
+## 💬 交流讨论
+
+如果你有任何问题、建议或想法：
+- 💡 [GitHub Discussions](https://github.com/cyrus0315/nodejs-backend-notes/discussions) - 讨论区
+- 🐛 [GitHub Issues](https://github.com/cyrus0315/nodejs-backend-notes/issues) - 问题反馈
+- ⭐ 给项目点个 Star，与更多人分享
+
+## 📄 许可证
+
+本项目采用 [MIT License](./LICENSE) 开源协议。
+
+## ⭐ Star History
+
+如果这个项目对你有帮助，请给个 Star ⭐️ 支持一下！
+
+[![Star History Chart](https://api.star-history.com/svg?repos=cyrus0315/nodejs-backend-notes&type=Date)](https://star-history.com/#cyrus0315/nodejs-backend-notes&Date)
+
+---
+
+<div align="center">
+
+**持续学习，慢慢积累。** 💪
+
+Made with ❤️ by [cyrus0315](https://github.com/cyrus0315)
+
+如果这个项目对你有帮助，欢迎 ⭐️ Star 支持一下！
+
+</div>
