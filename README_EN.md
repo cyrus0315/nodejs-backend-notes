@@ -222,36 +222,6 @@ If you're also learning Node.js backend development, feel free to exchange ideas
 
 ---
 
-## 🤝 Contributing
-
-Contributions are welcome! If you have suggestions or find issues:
-
-1. 🐛 [Submit an Issue](https://github.com/cyrus0315/nodejs-backend-notes/issues/new) to report problems or suggestions
-2. 🔧 [Submit a Pull Request](https://github.com/cyrus0315/nodejs-backend-notes/pulls) to contribute code or content
-3. ⭐ Give the project a Star to support
-4. 🔀 Fork the project and add your own notes
-
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for detailed contribution guidelines.
-
-## 💬 Discussions
-
-If you have questions, suggestions, or ideas:
-- 💡 [GitHub Discussions](https://github.com/cyrus0315/nodejs-backend-notes/discussions) - Discussion area
-- 🐛 [GitHub Issues](https://github.com/cyrus0315/nodejs-backend-notes/issues) - Bug reports
-- ⭐ Star the project to share with others
-
-## 📄 License
-
-This project is licensed under the [MIT License](./LICENSE).
-
-## ⭐ Star History
-
-If this project helps you, please give it a Star ⭐️!
-
-[![Star History Chart](https://api.star-history.com/svg?repos=cyrus0315/nodejs-backend-notes&type=Date)](https://star-history.com/#cyrus0315/nodejs-backend-notes&Date)
-
----
-
 <div align="center">
 
 **Keep learning, keep growing.** 💪

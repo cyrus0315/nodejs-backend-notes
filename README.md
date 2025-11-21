@@ -222,36 +222,6 @@
 
 ---
 
-## 🤝 贡献指南
-
-欢迎贡献！如果你有好的建议或发现了问题，请：
-
-1. 🐛 [提交 Issue](https://github.com/cyrus0315/nodejs-backend-notes/issues/new) 报告问题或提出建议
-2. 🔧 [提交 Pull Request](https://github.com/cyrus0315/nodejs-backend-notes/pulls) 贡献代码或内容
-3. ⭐ 给项目点个 Star 支持一下
-4. 🔀 Fork 项目，添加自己的笔记
-
-详细贡献指南请查看 [CONTRIBUTING.md](./CONTRIBUTING.md)
-
-## 💬 交流讨论
-
-如果你有任何问题、建议或想法：
-- 💡 [GitHub Discussions](https://github.com/cyrus0315/nodejs-backend-notes/discussions) - 讨论区
-- 🐛 [GitHub Issues](https://github.com/cyrus0315/nodejs-backend-notes/issues) - 问题反馈
-- ⭐ 给项目点个 Star，与更多人分享
-
-## 📄 许可证
-
-本项目采用 [MIT License](./LICENSE) 开源协议。
-
-## ⭐ Star History
-
-如果这个项目对你有帮助，请给个 Star ⭐️ 支持一下！
-
-[![Star History Chart](https://api.star-history.com/svg?repos=cyrus0315/nodejs-backend-notes&type=Date)](https://star-history.com/#cyrus0315/nodejs-backend-notes&Date)
-
----
-
 <div align="center">
 
 **持续学习，慢慢积累。** 💪
