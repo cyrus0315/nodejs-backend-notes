@@ -1239,6 +1239,1007 @@ app.use((req, res, next) => {
 
 ---
 
+## ReBAC（基于关系的访问控制）
+
+### ReBAC 简介
+
+ReBAC（Relationship-Based Access Control）基于实体之间的关系来确定访问权限，特别适用于社交应用、协作工具等场景。
+
+```
+核心概念：
+- 主体（Subject）：请求访问的用户
+- 对象（Object）：被访问的资源
+- 关系（Relation）：主体和对象之间的关系
+
+示例：
+- user:alice 是 doc:readme 的 owner
+- user:bob 是 folder:engineering 的 viewer
+- folder:engineering 包含 doc:readme
+- 因此 user:bob 可以查看 doc:readme
+```
+
+### ReBAC 数据模型
+
+```typescript
+// Prisma Schema
+model Entity {
+  id        String   @id @default(uuid())
+  namespace String   // user, doc, folder, org
+  objectId  String   // 实际的 ID
+  
+  @@unique([namespace, objectId])
+}
+
+model Relation {
+  id          String   @id @default(uuid())
+  subject     Entity   @relation("Subject", fields: [subjectId], references: [id])
+  subjectId   String
+  relation    String   // owner, editor, viewer, member, parent
+  object      Entity   @relation("Object", fields: [objectId], references: [id])
+  objectId    String
+  
+  createdAt   DateTime @default(now())
+  
+  @@unique([subjectId, relation, objectId])
+  @@index([objectId, relation])
+  @@index([subjectId])
+}
+```
+
+### ReBAC 实现
+
+```typescript
+interface TupleKey {
+  namespace: string;
+  objectId: string;
+}
+
+class ReBAC {
+  private prisma: PrismaClient;
+  
+  // 关系继承规则
+  private relationHierarchy: Record<string, string[]> = {
+    owner: ['editor', 'viewer'],
+    editor: ['viewer'],
+    admin: ['member'],
+    parent: [] // 用于层次结构
+  };
+
+  constructor(prisma: PrismaClient) {
+    this.prisma = prisma;
+  }
+
+  // 添加关系
+  async addRelation(
+    subject: TupleKey,
+    relation: string,
+    object: TupleKey
+  ): Promise<void> {
+    const subjectEntity = await this.getOrCreateEntity(subject);
+    const objectEntity = await this.getOrCreateEntity(object);
+
+    await this.prisma.relation.upsert({
+      where: {
+        subjectId_relation_objectId: {
+          subjectId: subjectEntity.id,
+          relation,
+          objectId: objectEntity.id
+        }
+      },
+      update: {},
+      create: {
+        subjectId: subjectEntity.id,
+        relation,
+        objectId: objectEntity.id
+      }
+    });
+  }
+
+  // 删除关系
+  async removeRelation(
+    subject: TupleKey,
+    relation: string,
+    object: TupleKey
+  ): Promise<void> {
+    const subjectEntity = await this.findEntity(subject);
+    const objectEntity = await this.findEntity(object);
+
+    if (subjectEntity && objectEntity) {
+      await this.prisma.relation.deleteMany({
+        where: {
+          subjectId: subjectEntity.id,
+          relation,
+          objectId: objectEntity.id
+        }
+      });
+    }
+  }
+
+  // 检查权限
+  async check(
+    subject: TupleKey,
+    relation: string,
+    object: TupleKey
+  ): Promise<boolean> {
+    // 1. 直接关系检查
+    const directCheck = await this.checkDirect(subject, relation, object);
+    if (directCheck) return true;
+
+    // 2. 关系继承检查
+    const inheritedRelations = this.getInheritingRelations(relation);
+    for (const inheritedRelation of inheritedRelations) {
+      const inherited = await this.checkDirect(subject, inheritedRelation, object);
+      if (inherited) return true;
+    }
+
+    // 3. 层次结构检查（如文件夹权限继承）
+    const parentObjects = await this.getParentObjects(object);
+    for (const parent of parentObjects) {
+      const hasParentAccess = await this.check(subject, relation, parent);
+      if (hasParentAccess) return true;
+    }
+
+    // 4. 组成员检查（用户组权限）
+    const groups = await this.getGroups(subject);
+    for (const group of groups) {
+      const hasGroupAccess = await this.check(group, relation, object);
+      if (hasGroupAccess) return true;
+    }
+
+    return false;
+  }
+
+  // 直接关系检查
+  private async checkDirect(
+    subject: TupleKey,
+    relation: string,
+    object: TupleKey
+  ): Promise<boolean> {
+    const subjectEntity = await this.findEntity(subject);
+    const objectEntity = await this.findEntity(object);
+
+    if (!subjectEntity || !objectEntity) return false;
+
+    const exists = await this.prisma.relation.findFirst({
+      where: {
+        subjectId: subjectEntity.id,
+        relation,
+        objectId: objectEntity.id
+      }
+    });
+
+    return !!exists;
+  }
+
+  // 获取继承的关系
+  private getInheritingRelations(relation: string): string[] {
+    const inheriting: string[] = [];
+    for (const [higherRelation, lowerRelations] of Object.entries(this.relationHierarchy)) {
+      if (lowerRelations.includes(relation)) {
+        inheriting.push(higherRelation);
+      }
+    }
+    return inheriting;
+  }
+
+  // 获取父对象
+  private async getParentObjects(object: TupleKey): Promise<TupleKey[]> {
+    const objectEntity = await this.findEntity(object);
+    if (!objectEntity) return [];
+
+    const parentRelations = await this.prisma.relation.findMany({
+      where: {
+        subjectId: objectEntity.id,
+        relation: 'parent'
+      },
+      include: { object: true }
+    });
+
+    return parentRelations.map(r => ({
+      namespace: r.object.namespace,
+      objectId: r.object.objectId
+    }));
+  }
+
+  // 获取用户所属的组
+  private async getGroups(subject: TupleKey): Promise<TupleKey[]> {
+    if (subject.namespace !== 'user') return [];
+
+    const subjectEntity = await this.findEntity(subject);
+    if (!subjectEntity) return [];
+
+    const groupRelations = await this.prisma.relation.findMany({
+      where: {
+        subjectId: subjectEntity.id,
+        relation: 'member'
+      },
+      include: { object: true }
+    });
+
+    return groupRelations
+      .filter(r => r.object.namespace === 'group')
+      .map(r => ({
+        namespace: r.object.namespace,
+        objectId: r.object.objectId
+      }));
+  }
+
+  // 列出用户可访问的对象
+  async listObjects(
+    subject: TupleKey,
+    relation: string,
+    objectNamespace: string
+  ): Promise<string[]> {
+    // 实际实现需要优化，这里是简化版本
+    const allObjects = await this.prisma.entity.findMany({
+      where: { namespace: objectNamespace }
+    });
+
+    const accessibleObjects: string[] = [];
+    for (const obj of allObjects) {
+      const hasAccess = await this.check(
+        subject,
+        relation,
+        { namespace: obj.namespace, objectId: obj.objectId }
+      );
+      if (hasAccess) {
+        accessibleObjects.push(obj.objectId);
+      }
+    }
+
+    return accessibleObjects;
+  }
+
+  private async getOrCreateEntity(key: TupleKey): Promise<Entity> {
+    return this.prisma.entity.upsert({
+      where: {
+        namespace_objectId: {
+          namespace: key.namespace,
+          objectId: key.objectId
+        }
+      },
+      update: {},
+      create: {
+        namespace: key.namespace,
+        objectId: key.objectId
+      }
+    });
+  }
+
+  private async findEntity(key: TupleKey): Promise<Entity | null> {
+    return this.prisma.entity.findUnique({
+      where: {
+        namespace_objectId: {
+          namespace: key.namespace,
+          objectId: key.objectId
+        }
+      }
+    });
+  }
+}
+
+// 使用示例
+const rebac = new ReBAC(prisma);
+
+// 设置关系
+await rebac.addRelation(
+  { namespace: 'user', objectId: 'alice' },
+  'owner',
+  { namespace: 'doc', objectId: 'readme' }
+);
+
+await rebac.addRelation(
+  { namespace: 'doc', objectId: 'readme' },
+  'parent',
+  { namespace: 'folder', objectId: 'engineering' }
+);
+
+await rebac.addRelation(
+  { namespace: 'user', objectId: 'bob' },
+  'viewer',
+  { namespace: 'folder', objectId: 'engineering' }
+);
+
+// 检查权限
+const canAliceEdit = await rebac.check(
+  { namespace: 'user', objectId: 'alice' },
+  'editor', // owner 继承 editor
+  { namespace: 'doc', objectId: 'readme' }
+); // true
+
+const canBobView = await rebac.check(
+  { namespace: 'user', objectId: 'bob' },
+  'viewer',
+  { namespace: 'doc', objectId: 'readme' }
+); // true (通过 folder 权限继承)
+
+// Express 中间件
+const requireReBAC = (relation: string, getObject: (req: Request) => TupleKey) => {
+  return async (req, res, next) => {
+    const subject = {
+      namespace: 'user',
+      objectId: req.user.id.toString()
+    };
+    const object = getObject(req);
+
+    const hasAccess = await rebac.check(subject, relation, object);
+
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    next();
+  };
+};
+
+// 使用
+app.get('/docs/:id',
+  requireAuth,
+  requireReBAC('viewer', (req) => ({
+    namespace: 'doc',
+    objectId: req.params.id
+  })),
+  getDocument
+);
+```
+
+---
+
+## Policy as Code（OPA/Rego）
+
+### OPA 简介
+
+Open Policy Agent (OPA) 是一个通用的策略引擎，使用 Rego 语言定义策略。
+
+```
+优势：
+- 策略与代码分离
+- 声明式策略语言
+- 高性能（编译为 WASM）
+- 丰富的生态系统
+```
+
+### Rego 策略示例
+
+```rego
+# policy.rego
+package authz
+
+import future.keywords.if
+import future.keywords.in
+
+# 默认拒绝
+default allow := false
+
+# 管理员可以做任何事
+allow if {
+    input.user.role == "admin"
+}
+
+# 用户可以读取自己的资源
+allow if {
+    input.action == "read"
+    input.resource.owner == input.user.id
+}
+
+# 用户可以创建资源
+allow if {
+    input.action == "create"
+    input.user.role in ["user", "editor", "admin"]
+}
+
+# 编辑可以更新草稿
+allow if {
+    input.action == "update"
+    input.user.role == "editor"
+    input.resource.status == "draft"
+}
+
+# 用户可以更新自己的资源
+allow if {
+    input.action == "update"
+    input.resource.owner == input.user.id
+}
+
+# 只有管理员可以删除
+allow if {
+    input.action == "delete"
+    input.user.role == "admin"
+}
+
+# 用户可以删除自己的草稿
+allow if {
+    input.action == "delete"
+    input.resource.owner == input.user.id
+    input.resource.status == "draft"
+}
+
+# 复杂规则：工作时间内才能发布
+allow if {
+    input.action == "publish"
+    input.user.role in ["editor", "admin"]
+    is_working_hours
+}
+
+is_working_hours if {
+    now := time.now_ns()
+    hour := time.clock([now, "Asia/Shanghai"])[0]
+    hour >= 9
+    hour < 18
+    weekday := time.weekday(now)
+    weekday != "Saturday"
+    weekday != "Sunday"
+}
+
+# 基于属性的规则
+allow if {
+    input.action == "view_salary"
+    input.user.department == "hr"
+    input.user.level >= 3
+}
+
+# 数据过滤规则
+filtered_data[field] = value if {
+    input.action == "read"
+    some field, value in input.resource.data
+    can_see_field(input.user.role, field)
+}
+
+can_see_field(role, field) if {
+    role == "admin"
+}
+
+can_see_field(role, field) if {
+    role == "user"
+    not field in ["salary", "ssn", "phone"]
+}
+```
+
+### OPA 集成
+
+```typescript
+import { OpaClient } from '@open-policy-agent/opa-wasm';
+import fs from 'fs';
+
+class OPAService {
+  private policy: OpaClient | null = null;
+
+  async init() {
+    // 加载编译后的 WASM
+    const wasmBundle = fs.readFileSync('./policy.wasm');
+    this.policy = await OpaClient.fromBundle(wasmBundle);
+  }
+
+  async evaluate(input: PolicyInput): Promise<PolicyResult> {
+    if (!this.policy) {
+      throw new Error('OPA not initialized');
+    }
+
+    const result = await this.policy.evaluate(input, 'authz/allow');
+    return result;
+  }
+
+  async isAllowed(
+    user: User,
+    action: string,
+    resource: Resource
+  ): Promise<boolean> {
+    const input = {
+      user: {
+        id: user.id,
+        role: user.role,
+        department: user.department,
+        level: user.level
+      },
+      action,
+      resource: {
+        type: resource.type,
+        id: resource.id,
+        owner: resource.ownerId,
+        status: resource.status,
+        data: resource.data
+      }
+    };
+
+    const result = await this.evaluate(input);
+    return result === true;
+  }
+
+  async filterData(
+    user: User,
+    resource: Resource
+  ): Promise<Record<string, any>> {
+    const input = {
+      user: {
+        id: user.id,
+        role: user.role
+      },
+      action: 'read',
+      resource: {
+        data: resource.data
+      }
+    };
+
+    const result = await this.policy!.evaluate(input, 'authz/filtered_data');
+    return result as Record<string, any>;
+  }
+}
+
+const opaService = new OPAService();
+await opaService.init();
+
+// Express 中间件
+const requireOPA = (action: string) => {
+  return async (req, res, next) => {
+    const resource = req.resource; // 需要先加载资源
+
+    const allowed = await opaService.isAllowed(
+      req.user,
+      action,
+      resource
+    );
+
+    if (!allowed) {
+      return res.status(403).json({ error: 'Forbidden by policy' });
+    }
+
+    next();
+  };
+};
+
+// 使用
+app.put('/api/posts/:id',
+  requireAuth,
+  loadResource('post'),
+  requireOPA('update'),
+  updatePost
+);
+
+app.get('/api/users/:id',
+  requireAuth,
+  async (req, res) => {
+    const user = await prisma.user.findUnique({
+      where: { id: parseInt(req.params.id) }
+    });
+
+    // 过滤敏感字段
+    const filteredData = await opaService.filterData(req.user, {
+      type: 'user',
+      id: user.id,
+      ownerId: user.id,
+      data: user
+    });
+
+    res.json(filteredData);
+  }
+);
+```
+
+### OPA REST API 集成
+
+```typescript
+import axios from 'axios';
+
+class OPARestClient {
+  private baseUrl: string;
+
+  constructor(baseUrl: string = 'http://localhost:8181') {
+    this.baseUrl = baseUrl;
+  }
+
+  async query(path: string, input: any): Promise<any> {
+    const response = await axios.post(
+      `${this.baseUrl}/v1/data/${path}`,
+      { input },
+      {
+        headers: { 'Content-Type': 'application/json' }
+      }
+    );
+
+    return response.data.result;
+  }
+
+  async isAllowed(input: any): Promise<boolean> {
+    const result = await this.query('authz/allow', input);
+    return result === true;
+  }
+}
+
+// 使用 OPA 服务
+const opaClient = new OPARestClient();
+
+const allowed = await opaClient.isAllowed({
+  user: { id: '123', role: 'editor' },
+  action: 'update',
+  resource: { type: 'post', status: 'draft' }
+});
+```
+
+---
+
+## API 网关授权
+
+### API Gateway 授权模式
+
+```
+模式 1：网关集中授权
+┌─────────┐     ┌──────────┐     ┌─────────┐
+│ Client  │────▶│ Gateway  │────▶│ Service │
+└─────────┘     │ (Auth)   │     └─────────┘
+                └──────────┘
+
+模式 2：网关 + 服务授权
+┌─────────┐     ┌──────────┐     ┌─────────┐
+│ Client  │────▶│ Gateway  │────▶│ Service │
+└─────────┘     │ (AuthN)  │     │ (AuthZ) │
+                └──────────┘     └─────────┘
+
+模式 3：Sidecar 模式（Service Mesh）
+┌─────────┐     ┌──────────────────────────┐
+│ Client  │────▶│ ┌───────┐  ┌───────────┐ │
+└─────────┘     │ │Envoy  │──│  Service  │ │
+                │ │(Auth) │  └───────────┘ │
+                │ └───────┘                │
+                └──────────────────────────┘
+```
+
+### Kong 授权插件
+
+```yaml
+# kong.yml
+_format_version: "2.1"
+
+services:
+  - name: api-service
+    url: http://api:3000
+
+routes:
+  - name: api-route
+    service: api-service
+    paths:
+      - /api
+
+plugins:
+  # JWT 认证
+  - name: jwt
+    route: api-route
+    config:
+      claims_to_verify:
+        - exp
+      header_names:
+        - Authorization
+
+  # ACL 授权
+  - name: acl
+    route: api-route
+    config:
+      allow:
+        - admin
+        - user
+
+  # Rate Limiting
+  - name: rate-limiting
+    route: api-route
+    config:
+      minute: 100
+      policy: local
+
+  # OPA 授权
+  - name: opa
+    route: api-route
+    config:
+      opa_url: http://opa:8181/v1/data/authz/allow
+```
+
+### Express Gateway 授权
+
+```javascript
+// gateway.config.yml
+http:
+  port: 8080
+
+apiEndpoints:
+  api:
+    host: '*'
+    paths: '/api/*'
+
+serviceEndpoints:
+  backend:
+    url: 'http://backend:3000'
+
+policies:
+  - jwt
+  - rbac
+  - proxy
+
+pipelines:
+  default:
+    apiEndpoints:
+      - api
+    policies:
+      # JWT 验证
+      - jwt:
+          action:
+            secretOrPublicKey: ${JWT_SECRET}
+            checkCredentialExistence: true
+
+      # RBAC 检查
+      - rbac:
+          action:
+            roles:
+              admin:
+                - '*'
+              user:
+                - 'GET /api/posts/*'
+                - 'POST /api/posts'
+              viewer:
+                - 'GET /api/posts/*'
+
+      # 代理到后端
+      - proxy:
+          action:
+            serviceEndpoint: backend
+```
+
+### 自定义网关授权
+
+```typescript
+import express from 'express';
+import httpProxy from 'http-proxy-middleware';
+
+const app = express();
+
+// 服务路由配置
+const serviceRoutes = {
+  '/api/users': 'http://user-service:3001',
+  '/api/posts': 'http://post-service:3002',
+  '/api/orders': 'http://order-service:3003'
+};
+
+// 路由权限配置
+const routePermissions = {
+  'GET /api/users': ['admin', 'user'],
+  'POST /api/users': ['admin'],
+  'DELETE /api/users/:id': ['admin'],
+  'GET /api/posts': ['admin', 'user', 'viewer'],
+  'POST /api/posts': ['admin', 'user'],
+  'PUT /api/posts/:id': ['admin', 'user'],
+  'DELETE /api/posts/:id': ['admin'],
+  'GET /api/orders': ['admin', 'user'],
+  'POST /api/orders': ['user']
+};
+
+// JWT 验证中间件
+async function authenticateJWT(req, res, next) {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  
+  if (!token) {
+    return res.status(401).json({ error: 'No token provided' });
+  }
+
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET!);
+    req.user = payload;
+    next();
+  } catch (error) {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+// RBAC 中间件
+function authorizeRBAC(req, res, next) {
+  const method = req.method;
+  const path = req.path;
+  
+  // 查找匹配的路由规则
+  const matchedRoute = findMatchingRoute(method, path);
+  
+  if (!matchedRoute) {
+    // 默认拒绝未定义的路由
+    return res.status(403).json({ error: 'Route not allowed' });
+  }
+
+  const allowedRoles = routePermissions[matchedRoute];
+  
+  if (!allowedRoles.includes(req.user.role)) {
+    return res.status(403).json({ error: 'Insufficient permissions' });
+  }
+
+  next();
+}
+
+function findMatchingRoute(method: string, path: string): string | null {
+  const routeKey = `${method} ${path}`;
+  
+  for (const [pattern, roles] of Object.entries(routePermissions)) {
+    const regex = patternToRegex(pattern);
+    if (regex.test(routeKey)) {
+      return pattern;
+    }
+  }
+  
+  return null;
+}
+
+function patternToRegex(pattern: string): RegExp {
+  const [method, path] = pattern.split(' ');
+  const regexPath = path
+    .replace(/:\w+/g, '[^/]+')
+    .replace(/\*/g, '.*');
+  return new RegExp(`^${method} ${regexPath}$`);
+}
+
+// 速率限制
+const rateLimiters = new Map<string, RateLimiter>();
+
+function rateLimit(req, res, next) {
+  const key = `${req.user?.id || req.ip}:${req.path}`;
+  
+  let limiter = rateLimiters.get(key);
+  if (!limiter) {
+    limiter = new RateLimiter(100, 60000); // 100 req/min
+    rateLimiters.set(key, limiter);
+  }
+
+  if (!limiter.tryConsume()) {
+    return res.status(429).json({ error: 'Too many requests' });
+  }
+
+  next();
+}
+
+// 审计日志
+function auditLog(req, res, next) {
+  const startTime = Date.now();
+  
+  res.on('finish', () => {
+    const duration = Date.now() - startTime;
+    
+    logger.info('API Request', {
+      method: req.method,
+      path: req.path,
+      userId: req.user?.id,
+      role: req.user?.role,
+      statusCode: res.statusCode,
+      duration,
+      ip: req.ip,
+      userAgent: req.headers['user-agent']
+    });
+  });
+
+  next();
+}
+
+// 设置代理
+for (const [path, target] of Object.entries(serviceRoutes)) {
+  app.use(
+    path,
+    authenticateJWT,
+    authorizeRBAC,
+    rateLimit,
+    auditLog,
+    httpProxy.createProxyMiddleware({
+      target,
+      changeOrigin: true,
+      pathRewrite: { [`^${path}`]: '' },
+      onProxyReq: (proxyReq, req) => {
+        // 将用户信息传递给后端服务
+        if (req.user) {
+          proxyReq.setHeader('X-User-Id', req.user.id);
+          proxyReq.setHeader('X-User-Role', req.user.role);
+          proxyReq.setHeader('X-User-Email', req.user.email);
+        }
+      }
+    })
+  );
+}
+
+app.listen(8080, () => {
+  console.log('API Gateway running on port 8080');
+});
+```
+
+### 服务间授权（mTLS + JWT）
+
+```typescript
+import https from 'https';
+import fs from 'fs';
+
+// 服务间通信的 JWT
+class ServiceToken {
+  private privateKey: string;
+  private publicKey: string;
+  private serviceName: string;
+
+  constructor(serviceName: string) {
+    this.serviceName = serviceName;
+    this.privateKey = fs.readFileSync(`./certs/${serviceName}-private.pem`, 'utf8');
+    this.publicKey = fs.readFileSync(`./certs/${serviceName}-public.pem`, 'utf8');
+  }
+
+  // 生成服务间调用 Token
+  generateToken(targetService: string): string {
+    return jwt.sign(
+      {
+        iss: this.serviceName,
+        aud: targetService,
+        iat: Math.floor(Date.now() / 1000),
+        exp: Math.floor(Date.now() / 1000) + 300 // 5 分钟
+      },
+      this.privateKey,
+      { algorithm: 'RS256' }
+    );
+  }
+
+  // 验证服务间 Token
+  verifyToken(token: string, expectedIssuer: string): any {
+    const publicKey = fs.readFileSync(
+      `./certs/${expectedIssuer}-public.pem`,
+      'utf8'
+    );
+    
+    return jwt.verify(token, publicKey, {
+      algorithms: ['RS256'],
+      audience: this.serviceName
+    });
+  }
+}
+
+// mTLS 配置
+const tlsOptions = {
+  key: fs.readFileSync('./certs/service-key.pem'),
+  cert: fs.readFileSync('./certs/service-cert.pem'),
+  ca: fs.readFileSync('./certs/ca-cert.pem'),
+  requestCert: true,
+  rejectUnauthorized: true
+};
+
+// 创建 HTTPS 服务
+https.createServer(tlsOptions, app).listen(443);
+
+// 验证客户端证书
+app.use((req, res, next) => {
+  const cert = req.socket.getPeerCertificate();
+  
+  if (!cert || !cert.subject) {
+    return res.status(401).json({ error: 'Client certificate required' });
+  }
+
+  // 验证证书 CN
+  const allowedServices = ['api-gateway', 'user-service', 'order-service'];
+  const serviceName = cert.subject.CN;
+  
+  if (!allowedServices.includes(serviceName)) {
+    return res.status(403).json({ error: 'Unknown service' });
+  }
+
+  req.clientService = serviceName;
+  next();
+});
+
+// 验证服务间 JWT
+app.use((req, res, next) => {
+  const serviceToken = req.headers['x-service-token'] as string;
+  
+  if (!serviceToken) {
+    return res.status(401).json({ error: 'Service token required' });
+  }
+
+  try {
+    const payload = serviceTokenManager.verifyToken(
+      serviceToken,
+      req.clientService
+    );
+    req.callingService = payload.iss;
+    next();
+  } catch (error) {
+    return res.status(401).json({ error: 'Invalid service token' });
+  }
+});
+```
+
+---
+
 ## 总结
 
 ### 授权模型选择
@@ -1248,6 +2249,8 @@ app.use((req, res, next) => {
 | **ACL** | 简单应用 | ⭐ | ⭐⭐ |
 | **RBAC** | 大多数应用 | ⭐⭐ | ⭐⭐⭐ |
 | **ABAC** | 复杂业务 | ⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ |
+| **ReBAC** | 社交/协作应用 | ⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ |
+| **Policy as Code** | 企业级应用 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ |
 
 ### 实践检查清单
 
@@ -1261,6 +2264,76 @@ app.use((req, res, next) => {
 - [ ] 权限变更如何通知？
 - [ ] 如何处理权限冲突？
 - [ ] 是否有权限管理界面？
+- [ ] 是否考虑 ReBAC 模型？
+- [ ] 是否使用 Policy as Code？
+- [ ] API 网关授权是否完善？
+- [ ] 服务间通信是否安全？
+
+### 高级授权面试题
+
+#### 6. ReBAC vs RBAC vs ABAC？
+
+| 特性 | RBAC | ABAC | ReBAC |
+|------|------|------|-------|
+| **核心** | 角色 | 属性 | 关系 |
+| **灵活性** | ⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ |
+| **表达能力** | 有限 | 强大 | 自然 |
+| **适用场景** | 组织权限 | 复杂规则 | 社交/协作 |
+
+**ReBAC 优势**：
+- 自然表达"所有者"、"成员"等关系
+- 支持权限继承（文件夹→文件）
+- 易于理解和维护
+
+#### 7. 什么是 Policy as Code？
+
+**概念**：将授权策略定义为代码，与应用代码分离管理。
+
+**优势**：
+- 📝 声明式定义，易于理解
+- 🔄 策略热更新，无需重启服务
+- 🧪 策略可测试、可版本控制
+- 🔒 审计友好
+
+**工具**：
+- OPA（Open Policy Agent）
+- Casbin
+- AWS IAM Policy
+- HashiCorp Sentinel
+
+#### 8. 微服务间如何授权？
+
+**方案**：
+
+1. **JWT 传递用户身份**
+```typescript
+// 网关验证后，将用户信息放入 Header
+proxyReq.setHeader('X-User-Id', user.id);
+proxyReq.setHeader('X-User-Role', user.role);
+```
+
+2. **服务间 mTLS**
+```typescript
+// 使用客户端证书验证服务身份
+const cert = req.socket.getPeerCertificate();
+const serviceName = cert.subject.CN;
+```
+
+3. **服务间 JWT**
+```typescript
+// 调用其他服务时生成短期 Token
+const serviceToken = generateServiceToken(targetService);
+```
+
+4. **Policy as Code（集中管理）**
+```rego
+# 服务 A 可以调用服务 B 的 API
+allow if {
+    input.caller == "service-a"
+    input.callee == "service-b"
+    input.action in ["read", "list"]
+}
+```
 
 ---
 

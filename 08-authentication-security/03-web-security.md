@@ -1160,6 +1160,669 @@ app.post('/api/keys', requireAuth, async (req, res) => {
 
 ---
 
+## SSRF（服务端请求伪造）
+
+### SSRF 原理
+
+SSRF 攻击利用服务器发起请求，访问内部资源或执行恶意操作。
+
+```
+攻击流程：
+1. 攻击者发送恶意 URL 给服务器
+   ↓
+2. 服务器根据 URL 发起请求
+   ↓
+3. 攻击者访问到内部资源
+   
+危害：
+- 访问内部服务（如 http://localhost:9200）
+- 读取云平台元数据（如 AWS 169.254.169.254）
+- 端口扫描内部网络
+- 绕过防火墙
+```
+
+### SSRF 漏洞示例
+
+```typescript
+// ❌ 危险：SSRF 漏洞
+app.post('/api/fetch-url', async (req, res) => {
+  const { url } = req.body;
+  
+  // 用户输入：http://169.254.169.254/latest/meta-data/
+  // 或：http://localhost:6379/
+  const response = await fetch(url);
+  const data = await response.text();
+  
+  res.send(data);
+});
+
+// ❌ 危险：通过图片 URL
+app.post('/api/upload-from-url', async (req, res) => {
+  const { imageUrl } = req.body;
+  
+  // 用户输入：file:///etc/passwd
+  const response = await fetch(imageUrl);
+  const buffer = await response.buffer();
+  
+  // 保存图片...
+});
+```
+
+### SSRF 防护
+
+```typescript
+import { URL } from 'url';
+import dns from 'dns';
+import { promisify } from 'util';
+
+const dnsLookup = promisify(dns.lookup);
+
+class SSRFProtection {
+  // 禁止的 IP 范围
+  private blockedRanges = [
+    // 私有 IP
+    /^10\./,
+    /^172\.(1[6-9]|2[0-9]|3[01])\./,
+    /^192\.168\./,
+    // 本地回环
+    /^127\./,
+    /^localhost$/i,
+    /^0\./,
+    // 链路本地
+    /^169\.254\./,
+    // IPv6 私有
+    /^::1$/,
+    /^fc00:/i,
+    /^fe80:/i,
+    // 云平台元数据
+    /^169\.254\.169\.254$/,
+    /^fd00:/i
+  ];
+
+  // 允许的协议
+  private allowedProtocols = ['http:', 'https:'];
+
+  // 允许的域名（白名单）
+  private allowedDomains: string[] = [];
+
+  constructor(allowedDomains: string[] = []) {
+    this.allowedDomains = allowedDomains;
+  }
+
+  async validateUrl(urlString: string): Promise<{ valid: boolean; error?: string }> {
+    try {
+      // 1. 解析 URL
+      const url = new URL(urlString);
+
+      // 2. 检查协议
+      if (!this.allowedProtocols.includes(url.protocol)) {
+        return { valid: false, error: `Protocol not allowed: ${url.protocol}` };
+      }
+
+      // 3. 检查端口（只允许 80 和 443）
+      const port = url.port || (url.protocol === 'https:' ? '443' : '80');
+      if (!['80', '443'].includes(port)) {
+        return { valid: false, error: `Port not allowed: ${port}` };
+      }
+
+      // 4. 白名单检查
+      if (this.allowedDomains.length > 0) {
+        const isAllowed = this.allowedDomains.some(
+          domain => url.hostname === domain || url.hostname.endsWith(`.${domain}`)
+        );
+        if (!isAllowed) {
+          return { valid: false, error: 'Domain not in whitelist' };
+        }
+      }
+
+      // 5. DNS 解析检查
+      const hostname = url.hostname;
+      
+      // 检查是否直接是 IP
+      if (this.isBlockedIP(hostname)) {
+        return { valid: false, error: 'IP address blocked' };
+      }
+
+      // DNS 解析获取真实 IP
+      try {
+        const { address } = await dnsLookup(hostname);
+        if (this.isBlockedIP(address)) {
+          return { valid: false, error: 'Resolved IP address blocked' };
+        }
+      } catch (e) {
+        return { valid: false, error: 'DNS resolution failed' };
+      }
+
+      return { valid: true };
+    } catch (e) {
+      return { valid: false, error: 'Invalid URL' };
+    }
+  }
+
+  private isBlockedIP(ip: string): boolean {
+    return this.blockedRanges.some(range => range.test(ip));
+  }
+}
+
+const ssrfProtection = new SSRFProtection([
+  'api.example.com',
+  'cdn.example.com'
+]);
+
+// ✅ 安全的实现
+app.post('/api/fetch-url', async (req, res) => {
+  const { url } = req.body;
+
+  // 验证 URL
+  const validation = await ssrfProtection.validateUrl(url);
+  if (!validation.valid) {
+    return res.status(400).json({ error: validation.error });
+  }
+
+  try {
+    // 设置超时和重定向限制
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+
+    const response = await fetch(url, {
+      signal: controller.signal,
+      redirect: 'manual', // 不跟随重定向
+      headers: {
+        'User-Agent': 'MyApp/1.0'
+      }
+    });
+
+    clearTimeout(timeout);
+
+    // 检查重定向目标
+    if (response.status >= 300 && response.status < 400) {
+      const redirectUrl = response.headers.get('location');
+      if (redirectUrl) {
+        const redirectValidation = await ssrfProtection.validateUrl(redirectUrl);
+        if (!redirectValidation.valid) {
+          return res.status(400).json({ error: 'Redirect URL blocked' });
+        }
+      }
+    }
+
+    const data = await response.text();
+    res.send(data);
+
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch URL' });
+  }
+});
+
+// ✅ 更安全：使用代理服务
+app.post('/api/fetch-url', async (req, res) => {
+  const { url } = req.body;
+
+  // 通过专用的出口代理访问外部资源
+  const response = await fetch(process.env.EGRESS_PROXY_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url })
+  });
+
+  // 代理服务负责 SSRF 防护
+  const data = await response.json();
+  res.json(data);
+});
+```
+
+---
+
+## 原型链污染（Prototype Pollution）
+
+### 原型链污染原理
+
+JavaScript 原型链污染攻击通过修改对象原型来影响所有对象实例。
+
+```typescript
+// JavaScript 原型链
+const obj = {};
+obj.__proto__ === Object.prototype; // true
+
+// 污染示例
+obj.__proto__.polluted = true;
+
+// 所有对象都受影响
+const newObj = {};
+console.log(newObj.polluted); // true
+```
+
+### 漏洞示例
+
+```typescript
+// ❌ 危险：递归合并对象
+function merge(target: any, source: any): any {
+  for (const key in source) {
+    if (typeof source[key] === 'object' && source[key] !== null) {
+      if (!target[key]) target[key] = {};
+      merge(target[key], source[key]);
+    } else {
+      target[key] = source[key];
+    }
+  }
+  return target;
+}
+
+// 攻击载荷
+const maliciousPayload = JSON.parse(
+  '{"__proto__": {"isAdmin": true}}'
+);
+
+const user = {};
+merge(user, maliciousPayload);
+
+// 所有对象都被污染
+const newUser = {};
+console.log(newUser.isAdmin); // true !
+
+// ❌ 危险：路径赋值
+function setPath(obj: any, path: string, value: any) {
+  const keys = path.split('.');
+  let current = obj;
+  
+  for (let i = 0; i < keys.length - 1; i++) {
+    if (!current[keys[i]]) current[keys[i]] = {};
+    current = current[keys[i]];
+  }
+  
+  current[keys[keys.length - 1]] = value;
+}
+
+// 攻击
+setPath({}, '__proto__.polluted', true);
+```
+
+### 原型链污染防护
+
+```typescript
+// ✅ 方法 1：使用 Object.create(null)
+function safeMerge(target: any, source: any): any {
+  const result = Object.create(null);
+  
+  for (const key of Object.keys(target)) {
+    result[key] = target[key];
+  }
+  
+  for (const key of Object.keys(source)) {
+    // 跳过危险属性
+    if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+      continue;
+    }
+    
+    if (
+      typeof source[key] === 'object' &&
+      source[key] !== null &&
+      !Array.isArray(source[key])
+    ) {
+      result[key] = safeMerge(result[key] || {}, source[key]);
+    } else {
+      result[key] = source[key];
+    }
+  }
+  
+  return result;
+}
+
+// ✅ 方法 2：使用 Object.hasOwn() 或 hasOwnProperty
+function safeSetPath(obj: any, path: string, value: any) {
+  const dangerousKeys = ['__proto__', 'constructor', 'prototype'];
+  const keys = path.split('.');
+  
+  // 检查危险键
+  if (keys.some(key => dangerousKeys.includes(key))) {
+    throw new Error('Dangerous path detected');
+  }
+  
+  let current = obj;
+  
+  for (let i = 0; i < keys.length - 1; i++) {
+    const key = keys[i];
+    if (!Object.hasOwn(current, key)) {
+      current[key] = {};
+    }
+    current = current[key];
+  }
+  
+  current[keys[keys.length - 1]] = value;
+}
+
+// ✅ 方法 3：使用安全的库
+import merge from 'lodash.merge'; // lodash 已修复此问题
+import cloneDeep from 'lodash.clonedeep';
+
+// ✅ 方法 4：冻结原型
+Object.freeze(Object.prototype);
+Object.freeze(Array.prototype);
+
+// ✅ 方法 5：输入验证
+import { z } from 'zod';
+
+const SafeObjectSchema = z.object({}).passthrough().refine(
+  (obj) => {
+    const checkKeys = (o: any): boolean => {
+      for (const key of Object.keys(o)) {
+        if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+          return false;
+        }
+        if (typeof o[key] === 'object' && o[key] !== null) {
+          if (!checkKeys(o[key])) return false;
+        }
+      }
+      return true;
+    };
+    return checkKeys(obj);
+  },
+  { message: 'Object contains dangerous keys' }
+);
+
+app.post('/api/data', (req, res) => {
+  try {
+    const safeData = SafeObjectSchema.parse(req.body);
+    // 处理数据...
+  } catch (error) {
+    res.status(400).json({ error: 'Invalid data' });
+  }
+});
+
+// ✅ 方法 6：使用 Map 代替普通对象
+const safeStorage = new Map<string, any>();
+safeStorage.set('user', { name: 'John' });
+// Map 不受原型链污染影响
+```
+
+### 检测原型链污染
+
+```typescript
+// 检测原型是否被污染
+function checkPrototypePollution(): boolean {
+  const testObj = {};
+  
+  // 检查常见的污染属性
+  const suspiciousKeys = [
+    'isAdmin',
+    'role',
+    'admin',
+    'authenticated',
+    'polluted'
+  ];
+  
+  for (const key of suspiciousKeys) {
+    if ((testObj as any)[key] !== undefined) {
+      console.error(`Prototype pollution detected: ${key}`);
+      return true;
+    }
+  }
+  
+  return false;
+}
+
+// 定期检测
+setInterval(() => {
+  if (checkPrototypePollution()) {
+    // 记录并告警
+    logger.error('Prototype pollution detected!');
+    Sentry.captureMessage('Prototype pollution detected');
+  }
+}, 60000);
+```
+
+---
+
+## 路径遍历（Path Traversal）
+
+### 路径遍历原理
+
+攻击者通过操纵文件路径访问服务器上的任意文件。
+
+```
+攻击示例：
+- ../../../etc/passwd
+- ..%2F..%2F..%2Fetc/passwd（URL 编码）
+- ....//....//etc/passwd（双写绕过）
+- /var/www/app/../../../etc/passwd
+```
+
+### 漏洞示例
+
+```typescript
+import path from 'path';
+import fs from 'fs';
+
+// ❌ 危险：直接拼接路径
+app.get('/api/files/:filename', (req, res) => {
+  const { filename } = req.params;
+  
+  // 用户输入：../../../etc/passwd
+  const filepath = `./uploads/${filename}`;
+  
+  // 读取任意文件！
+  const content = fs.readFileSync(filepath, 'utf8');
+  res.send(content);
+});
+
+// ❌ 危险：包含用户输入的路径
+app.get('/api/download', (req, res) => {
+  const { file } = req.query;
+  
+  // 用户输入：file=../../../../etc/passwd
+  res.download(`./public/${file}`);
+});
+```
+
+### 路径遍历防护
+
+```typescript
+import path from 'path';
+import fs from 'fs';
+
+class PathSecurity {
+  private basePath: string;
+
+  constructor(basePath: string) {
+    // 规范化并解析为绝对路径
+    this.basePath = path.resolve(basePath);
+  }
+
+  // 验证路径是否在允许的目录内
+  isPathSafe(userPath: string): boolean {
+    // 规范化路径
+    const normalizedPath = path.normalize(userPath);
+    
+    // 解析为绝对路径
+    const resolvedPath = path.resolve(this.basePath, normalizedPath);
+    
+    // 检查是否在基础目录内
+    return resolvedPath.startsWith(this.basePath + path.sep) ||
+           resolvedPath === this.basePath;
+  }
+
+  // 获取安全的绝对路径
+  getSafePath(userPath: string): string | null {
+    if (!this.isPathSafe(userPath)) {
+      return null;
+    }
+    
+    return path.resolve(this.basePath, path.normalize(userPath));
+  }
+
+  // 验证文件名
+  isValidFilename(filename: string): boolean {
+    // 禁止路径分隔符
+    if (filename.includes('/') || filename.includes('\\')) {
+      return false;
+    }
+    
+    // 禁止空字节
+    if (filename.includes('\0')) {
+      return false;
+    }
+    
+    // 禁止 .. 
+    if (filename.includes('..')) {
+      return false;
+    }
+    
+    // 只允许安全字符
+    const safePattern = /^[a-zA-Z0-9_\-\.]+$/;
+    return safePattern.test(filename);
+  }
+}
+
+const uploadsPath = new PathSecurity('./uploads');
+
+// ✅ 安全的文件访问
+app.get('/api/files/:filename', (req, res) => {
+  const { filename } = req.params;
+
+  // 验证文件名
+  if (!uploadsPath.isValidFilename(filename)) {
+    return res.status(400).json({ error: 'Invalid filename' });
+  }
+
+  // 获取安全路径
+  const safePath = uploadsPath.getSafePath(filename);
+  if (!safePath) {
+    return res.status(403).json({ error: 'Access denied' });
+  }
+
+  // 检查文件是否存在
+  if (!fs.existsSync(safePath)) {
+    return res.status(404).json({ error: 'File not found' });
+  }
+
+  // 检查是否是文件（而不是目录）
+  const stat = fs.statSync(safePath);
+  if (!stat.isFile()) {
+    return res.status(400).json({ error: 'Not a file' });
+  }
+
+  res.sendFile(safePath);
+});
+
+// ✅ 使用白名单
+const allowedFiles = new Set(['readme.txt', 'license.txt', 'changelog.md']);
+
+app.get('/api/docs/:filename', (req, res) => {
+  const { filename } = req.params;
+
+  if (!allowedFiles.has(filename)) {
+    return res.status(404).json({ error: 'File not found' });
+  }
+
+  const safePath = path.join(__dirname, 'docs', filename);
+  res.sendFile(safePath);
+});
+
+// ✅ 使用数据库存储文件信息
+app.get('/api/files/:id', async (req, res) => {
+  const { id } = req.params;
+
+  // 从数据库获取文件信息
+  const file = await prisma.file.findUnique({
+    where: { id: parseInt(id) }
+  });
+
+  if (!file) {
+    return res.status(404).json({ error: 'File not found' });
+  }
+
+  // 检查权限
+  if (file.userId !== req.user.id && req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Access denied' });
+  }
+
+  // 使用数据库中存储的安全路径
+  const safePath = path.join(
+    process.env.UPLOAD_DIR!,
+    file.storedFilename // 服务器生成的文件名
+  );
+
+  res.download(safePath, file.originalFilename);
+});
+
+// ✅ 使用随机文件名存储
+import { v4 as uuidv4 } from 'uuid';
+
+app.post('/api/upload', upload.single('file'), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'No file uploaded' });
+  }
+
+  // 生成安全的存储文件名
+  const ext = path.extname(req.file.originalname);
+  const storedFilename = `${uuidv4()}${ext}`;
+
+  // 移动文件到存储目录
+  const storedPath = path.join(process.env.UPLOAD_DIR!, storedFilename);
+  await fs.promises.rename(req.file.path, storedPath);
+
+  // 保存文件信息到数据库
+  const file = await prisma.file.create({
+    data: {
+      originalFilename: req.file.originalname,
+      storedFilename,
+      mimeType: req.file.mimetype,
+      size: req.file.size,
+      userId: req.user.id
+    }
+  });
+
+  res.json({ fileId: file.id });
+});
+```
+
+### ZIP 文件路径遍历（Zip Slip）
+
+```typescript
+import unzipper from 'unzipper';
+
+// ❌ 危险：直接解压
+app.post('/api/extract', upload.single('archive'), async (req, res) => {
+  const extractPath = './extracted';
+  
+  // ZIP 中的文件名可能包含 ../
+  await fs.createReadStream(req.file.path)
+    .pipe(unzipper.Extract({ path: extractPath }));
+});
+
+// ✅ 安全：验证每个文件路径
+app.post('/api/extract', upload.single('archive'), async (req, res) => {
+  const extractPath = path.resolve('./extracted');
+  const pathSecurity = new PathSecurity(extractPath);
+
+  const directory = await unzipper.Open.file(req.file.path);
+
+  for (const entry of directory.files) {
+    // 验证路径
+    const targetPath = pathSecurity.getSafePath(entry.path);
+    
+    if (!targetPath) {
+      console.warn(`Skipping unsafe path: ${entry.path}`);
+      continue;
+    }
+
+    if (entry.type === 'Directory') {
+      await fs.promises.mkdir(targetPath, { recursive: true });
+    } else {
+      // 确保目录存在
+      await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
+      
+      // 解压文件
+      const content = await entry.buffer();
+      await fs.promises.writeFile(targetPath, content);
+    }
+  }
+
+  res.json({ message: 'Extracted successfully' });
+});
+```
+
+---
+
 ## 总结
 
 ### 安全检查清单
@@ -1200,6 +1863,12 @@ app.post('/api/keys', requireAuth, async (req, res) => {
 - [ ] 防止点击劫持
 - [ ] 防止 MIME 嗅探
 
+#### 高级防护
+- [ ] 防护 SSRF 攻击
+- [ ] 防护原型链污染
+- [ ] 防护路径遍历
+- [ ] ZIP 文件安全解压
+
 #### 依赖管理
 - [ ] 定期更新依赖
 - [ ] 使用 npm audit
@@ -1209,6 +1878,48 @@ app.post('/api/keys', requireAuth, async (req, res) => {
 - [ ] 记录安全事件
 - [ ] 监控异常行为
 - [ ] 实施告警机制
+
+### 高级安全面试题
+
+#### 6. SSRF 攻击如何防护？
+
+**防护措施**：
+
+1. **URL 白名单**：只允许访问特定域名
+2. **IP 黑名单**：禁止私有 IP、本地回环、云元数据
+3. **DNS 解析验证**：检查解析后的真实 IP
+4. **禁用重定向**：或验证重定向目标
+5. **协议限制**：只允许 HTTP/HTTPS
+6. **端口限制**：只允许 80/443
+7. **使用出口代理**：集中管理出口流量
+
+#### 7. 原型链污染有哪些危害？
+
+**危害**：
+
+- 🔓 **权限绕过**：`{}.isAdmin = true`
+- 💉 **注入攻击**：污染模板引擎
+- 🛠️ **DoS 攻击**：污染核心方法
+- 🔐 **认证绕过**：修改校验逻辑
+
+**防护**：
+
+- 使用 `Object.create(null)`
+- 过滤危险键（`__proto__`、`constructor`）
+- 使用 Map 代替普通对象
+- 冻结原型
+
+#### 8. 路径遍历如何防护？
+
+**核心原则**：永远不信任用户输入的路径
+
+**防护措施**：
+
+1. **路径规范化**：`path.normalize()`
+2. **路径解析验证**：检查解析后的路径是否在允许目录内
+3. **文件名白名单**：只允许字母、数字、下划线
+4. **数据库存储映射**：用 ID 查询，不用文件名
+5. **随机文件名**：存储时使用 UUID
 
 ---
 

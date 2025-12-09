@@ -1292,6 +1292,1141 @@ HMAC-SHA1 算法
 
 ---
 
+## WebAuthn/FIDO2（无密码认证）
+
+### WebAuthn 简介
+
+WebAuthn 是 W3C 标准，允许使用生物识别、安全密钥等方式进行无密码认证。
+
+```
+优势：
+- 🔐 抗钓鱼（基于域名绑定）
+- 🚀 用户体验好（指纹、Face ID）
+- 💪 高安全性（私钥永不离开设备）
+- 🔑 无需记忆密码
+```
+
+### WebAuthn 流程
+
+```
+注册流程：
+1. 服务器生成 challenge
+   ↓
+2. 浏览器调用 navigator.credentials.create()
+   ↓
+3. 认证器（如 YubiKey、Touch ID）生成密钥对
+   ↓
+4. 返回公钥给服务器
+   ↓
+5. 服务器存储公钥
+
+认证流程：
+1. 服务器生成 challenge
+   ↓
+2. 浏览器调用 navigator.credentials.get()
+   ↓
+3. 认证器使用私钥签名 challenge
+   ↓
+4. 服务器验证签名
+```
+
+### WebAuthn 实现
+
+```typescript
+import {
+  generateRegistrationOptions,
+  verifyRegistrationResponse,
+  generateAuthenticationOptions,
+  verifyAuthenticationResponse
+} from '@simplewebauthn/server';
+import { isoUint8Array } from '@simplewebauthn/server/helpers';
+
+// 配置
+const rpName = 'My App';
+const rpID = 'example.com';
+const origin = `https://${rpID}`;
+
+// ===== 注册流程 =====
+
+// 1. 生成注册选项
+app.post('/api/webauthn/register/options', requireAuth, async (req, res) => {
+  const user = req.user;
+
+  // 获取用户已有的认证器
+  const userAuthenticators = await prisma.authenticator.findMany({
+    where: { userId: user.id }
+  });
+
+  const options = await generateRegistrationOptions({
+    rpName,
+    rpID,
+    userID: isoUint8Array.fromUTF8String(user.id.toString()),
+    userName: user.email,
+    userDisplayName: user.name,
+    // 排除已注册的认证器
+    excludeCredentials: userAuthenticators.map(auth => ({
+      id: auth.credentialID,
+      type: 'public-key',
+      transports: auth.transports
+    })),
+    authenticatorSelection: {
+      // 跨平台认证器（如 YubiKey）或平台认证器（如 Touch ID）
+      authenticatorAttachment: 'platform',
+      residentKey: 'preferred',
+      userVerification: 'preferred'
+    }
+  });
+
+  // 保存 challenge 用于验证
+  await redis.setex(`webauthn:challenge:${user.id}`, 300, options.challenge);
+
+  res.json(options);
+});
+
+// 2. 验证注册响应
+app.post('/api/webauthn/register/verify', requireAuth, async (req, res) => {
+  const user = req.user;
+  const { body } = req;
+
+  // 获取保存的 challenge
+  const expectedChallenge = await redis.get(`webauthn:challenge:${user.id}`);
+  if (!expectedChallenge) {
+    return res.status(400).json({ error: 'Challenge expired' });
+  }
+
+  try {
+    const verification = await verifyRegistrationResponse({
+      response: body,
+      expectedChallenge,
+      expectedOrigin: origin,
+      expectedRPID: rpID
+    });
+
+    if (verification.verified && verification.registrationInfo) {
+      const { credentialPublicKey, credentialID, counter } = verification.registrationInfo;
+
+      // 保存认证器信息
+      await prisma.authenticator.create({
+        data: {
+          userId: user.id,
+          credentialID: Buffer.from(credentialID),
+          credentialPublicKey: Buffer.from(credentialPublicKey),
+          counter,
+          transports: body.response.transports || []
+        }
+      });
+
+      // 清除 challenge
+      await redis.del(`webauthn:challenge:${user.id}`);
+
+      res.json({ verified: true });
+    } else {
+      res.status(400).json({ error: 'Verification failed' });
+    }
+  } catch (error) {
+    console.error('WebAuthn registration error:', error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// ===== 认证流程 =====
+
+// 3. 生成认证选项
+app.post('/api/webauthn/authenticate/options', async (req, res) => {
+  const { email } = req.body;
+
+  const user = await prisma.user.findUnique({
+    where: { email },
+    include: { authenticators: true }
+  });
+
+  if (!user || user.authenticators.length === 0) {
+    return res.status(400).json({ error: 'No authenticators found' });
+  }
+
+  const options = await generateAuthenticationOptions({
+    rpID,
+    allowCredentials: user.authenticators.map(auth => ({
+      id: auth.credentialID,
+      type: 'public-key',
+      transports: auth.transports
+    })),
+    userVerification: 'preferred'
+  });
+
+  // 保存 challenge
+  await redis.setex(`webauthn:auth:challenge:${email}`, 300, options.challenge);
+
+  res.json(options);
+});
+
+// 4. 验证认证响应
+app.post('/api/webauthn/authenticate/verify', async (req, res) => {
+  const { email, ...body } = req.body;
+
+  const user = await prisma.user.findUnique({
+    where: { email },
+    include: { authenticators: true }
+  });
+
+  if (!user) {
+    return res.status(400).json({ error: 'User not found' });
+  }
+
+  const expectedChallenge = await redis.get(`webauthn:auth:challenge:${email}`);
+  if (!expectedChallenge) {
+    return res.status(400).json({ error: 'Challenge expired' });
+  }
+
+  // 找到使用的认证器
+  const authenticator = user.authenticators.find(
+    auth => Buffer.from(auth.credentialID).equals(Buffer.from(body.id, 'base64url'))
+  );
+
+  if (!authenticator) {
+    return res.status(400).json({ error: 'Authenticator not found' });
+  }
+
+  try {
+    const verification = await verifyAuthenticationResponse({
+      response: body,
+      expectedChallenge,
+      expectedOrigin: origin,
+      expectedRPID: rpID,
+      authenticator: {
+        credentialID: authenticator.credentialID,
+        credentialPublicKey: authenticator.credentialPublicKey,
+        counter: authenticator.counter
+      }
+    });
+
+    if (verification.verified) {
+      // 更新计数器（防止重放攻击）
+      await prisma.authenticator.update({
+        where: { id: authenticator.id },
+        data: { counter: verification.authenticationInfo.newCounter }
+      });
+
+      // 清除 challenge
+      await redis.del(`webauthn:auth:challenge:${email}`);
+
+      // 生成 JWT
+      const token = jwtManager.generateAccessToken({
+        userId: user.id,
+        email: user.email,
+        role: user.role
+      });
+
+      res.json({ verified: true, token });
+    } else {
+      res.status(400).json({ error: 'Verification failed' });
+    }
+  } catch (error) {
+    console.error('WebAuthn authentication error:', error);
+    res.status(400).json({ error: error.message });
+  }
+});
+```
+
+### 前端实现
+
+```typescript
+// 注册
+async function registerWebAuthn() {
+  // 1. 获取注册选项
+  const optionsRes = await fetch('/api/webauthn/register/options', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${token}` }
+  });
+  const options = await optionsRes.json();
+
+  // 2. 调用浏览器 API
+  const credential = await navigator.credentials.create({
+    publicKey: {
+      ...options,
+      challenge: base64urlToBuffer(options.challenge),
+      user: {
+        ...options.user,
+        id: base64urlToBuffer(options.user.id)
+      },
+      excludeCredentials: options.excludeCredentials?.map(cred => ({
+        ...cred,
+        id: base64urlToBuffer(cred.id)
+      }))
+    }
+  });
+
+  // 3. 发送给服务器验证
+  const verifyRes = await fetch('/api/webauthn/register/verify', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`
+    },
+    body: JSON.stringify({
+      id: credential.id,
+      rawId: bufferToBase64url(credential.rawId),
+      response: {
+        clientDataJSON: bufferToBase64url(credential.response.clientDataJSON),
+        attestationObject: bufferToBase64url(credential.response.attestationObject),
+        transports: credential.response.getTransports?.() || []
+      },
+      type: credential.type
+    })
+  });
+
+  return verifyRes.json();
+}
+
+// 认证
+async function authenticateWebAuthn(email: string) {
+  // 1. 获取认证选项
+  const optionsRes = await fetch('/api/webauthn/authenticate/options', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email })
+  });
+  const options = await optionsRes.json();
+
+  // 2. 调用浏览器 API
+  const credential = await navigator.credentials.get({
+    publicKey: {
+      ...options,
+      challenge: base64urlToBuffer(options.challenge),
+      allowCredentials: options.allowCredentials?.map(cred => ({
+        ...cred,
+        id: base64urlToBuffer(cred.id)
+      }))
+    }
+  });
+
+  // 3. 发送给服务器验证
+  const verifyRes = await fetch('/api/webauthn/authenticate/verify', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      email,
+      id: credential.id,
+      rawId: bufferToBase64url(credential.rawId),
+      response: {
+        clientDataJSON: bufferToBase64url(credential.response.clientDataJSON),
+        authenticatorData: bufferToBase64url(credential.response.authenticatorData),
+        signature: bufferToBase64url(credential.response.signature),
+        userHandle: credential.response.userHandle
+          ? bufferToBase64url(credential.response.userHandle)
+          : null
+      },
+      type: credential.type
+    })
+  });
+
+  return verifyRes.json();
+}
+
+// 工具函数
+function base64urlToBuffer(base64url: string): ArrayBuffer {
+  const base64 = base64url.replace(/-/g, '+').replace(/_/g, '/');
+  const padding = '='.repeat((4 - base64.length % 4) % 4);
+  const binary = atob(base64 + padding);
+  return Uint8Array.from(binary, c => c.charCodeAt(0)).buffer;
+}
+
+function bufferToBase64url(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  bytes.forEach(b => binary += String.fromCharCode(b));
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
+```
+
+---
+
+## Magic Link（魔术链接）
+
+### Magic Link 原理
+
+通过邮件发送一次性登录链接，用户点击即可登录，无需密码。
+
+```
+流程：
+1. 用户输入邮箱
+   ↓
+2. 服务器生成一次性 Token
+   ↓
+3. 发送带 Token 的链接到邮箱
+   ↓
+4. 用户点击链接
+   ↓
+5. 服务器验证 Token
+   ↓
+6. 登录成功，生成 Session/JWT
+```
+
+### Magic Link 实现
+
+```typescript
+import crypto from 'crypto';
+import nodemailer from 'nodemailer';
+
+// 邮件配置
+const transporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: Number(process.env.SMTP_PORT),
+  secure: true,
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS
+  }
+});
+
+// 1. 请求 Magic Link
+app.post('/api/auth/magic-link', async (req, res) => {
+  const { email } = req.body;
+
+  // 验证邮箱格式
+  if (!email || !validator.isEmail(email)) {
+    return res.status(400).json({ error: 'Invalid email' });
+  }
+
+  // 检查用户是否存在（或自动创建）
+  let user = await prisma.user.findUnique({ where: { email } });
+  if (!user) {
+    // 可选：自动注册
+    user = await prisma.user.create({
+      data: { email, name: email.split('@')[0] }
+    });
+  }
+
+  // 生成安全 Token
+  const token = crypto.randomBytes(32).toString('hex');
+  const hashedToken = crypto.createHash('sha256').update(token).digest('hex');
+
+  // 保存 Token（15 分钟过期）
+  await prisma.magicLinkToken.create({
+    data: {
+      token: hashedToken,
+      userId: user.id,
+      expiresAt: new Date(Date.now() + 15 * 60 * 1000)
+    }
+  });
+
+  // 构建 Magic Link
+  const magicLink = `${process.env.FRONTEND_URL}/auth/magic?token=${token}&email=${encodeURIComponent(email)}`;
+
+  // 发送邮件
+  await transporter.sendMail({
+    from: `"My App" <${process.env.SMTP_FROM}>`,
+    to: email,
+    subject: '登录链接 - My App',
+    html: `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+        <h2>登录 My App</h2>
+        <p>点击下面的按钮登录你的账户：</p>
+        <a href="${magicLink}" 
+           style="display: inline-block; background: #4F46E5; color: white; 
+                  padding: 12px 24px; text-decoration: none; border-radius: 6px;">
+          登录
+        </a>
+        <p style="margin-top: 20px; color: #666;">
+          此链接将在 15 分钟后过期。如果你没有请求此链接，请忽略此邮件。
+        </p>
+        <p style="color: #999; font-size: 12px;">
+          或者复制此链接到浏览器：<br>
+          ${magicLink}
+        </p>
+      </div>
+    `
+  });
+
+  res.json({ message: 'Magic link sent to your email' });
+});
+
+// 2. 验证 Magic Link
+app.post('/api/auth/magic-link/verify', async (req, res) => {
+  const { token, email } = req.body;
+
+  if (!token || !email) {
+    return res.status(400).json({ error: 'Missing token or email' });
+  }
+
+  // 哈希 Token 进行比对
+  const hashedToken = crypto.createHash('sha256').update(token).digest('hex');
+
+  // 查找并验证 Token
+  const magicLinkToken = await prisma.magicLinkToken.findFirst({
+    where: {
+      token: hashedToken,
+      user: { email },
+      expiresAt: { gt: new Date() },
+      usedAt: null
+    },
+    include: { user: true }
+  });
+
+  if (!magicLinkToken) {
+    return res.status(400).json({ error: 'Invalid or expired token' });
+  }
+
+  // 标记 Token 已使用
+  await prisma.magicLinkToken.update({
+    where: { id: magicLinkToken.id },
+    data: { usedAt: new Date() }
+  });
+
+  // 生成 JWT
+  const accessToken = jwtManager.generateAccessToken({
+    userId: magicLinkToken.user.id,
+    email: magicLinkToken.user.email,
+    role: magicLinkToken.user.role
+  });
+
+  const refreshToken = jwtManager.generateRefreshToken(magicLinkToken.user.id);
+
+  // 保存 Refresh Token
+  await prisma.refreshToken.create({
+    data: {
+      token: refreshToken,
+      userId: magicLinkToken.user.id,
+      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
+    }
+  });
+
+  res.json({
+    message: 'Login successful',
+    accessToken,
+    refreshToken,
+    user: {
+      id: magicLinkToken.user.id,
+      name: magicLinkToken.user.name,
+      email: magicLinkToken.user.email
+    }
+  });
+});
+
+// 3. 清理过期 Token（定时任务）
+async function cleanupExpiredMagicLinks() {
+  await prisma.magicLinkToken.deleteMany({
+    where: {
+      OR: [
+        { expiresAt: { lt: new Date() } },
+        { usedAt: { not: null } }
+      ]
+    }
+  });
+}
+
+// 每小时清理一次
+setInterval(cleanupExpiredMagicLinks, 60 * 60 * 1000);
+```
+
+### Magic Link 安全考虑
+
+```typescript
+// 1. 限流（防止滥用）
+const magicLinkLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 小时
+  max: 3, // 每小时最多 3 次
+  keyGenerator: (req) => req.body.email,
+  message: 'Too many magic link requests'
+});
+
+app.post('/api/auth/magic-link', magicLinkLimiter, requestMagicLink);
+
+// 2. Token 一次性使用
+// 验证后立即标记为已使用
+
+// 3. 短过期时间
+// 15-30 分钟为宜
+
+// 4. 哈希存储
+// 数据库存储哈希后的 Token
+
+// 5. 安全的 Token 生成
+const token = crypto.randomBytes(32).toString('hex'); // 256 bits
+```
+
+---
+
+## OpenID Connect (OIDC)
+
+### OIDC 简介
+
+OIDC 是建立在 OAuth 2.0 之上的身份认证协议，提供了标准化的身份验证流程。
+
+```
+OAuth 2.0 vs OIDC：
+- OAuth 2.0：授权（Access Token）
+- OIDC：认证（ID Token）+ 授权
+
+OIDC 增加的内容：
+- ID Token（JWT 格式）
+- UserInfo 端点
+- 标准化的用户属性（claims）
+- Discovery（自动发现配置）
+```
+
+### OIDC 实现（作为客户端）
+
+```typescript
+import { Issuer, generators } from 'openid-client';
+
+// 1. 配置 OIDC Provider
+async function setupOIDC() {
+  // 自动发现配置
+  const googleIssuer = await Issuer.discover('https://accounts.google.com');
+  
+  // 创建客户端
+  const client = new googleIssuer.Client({
+    client_id: process.env.GOOGLE_CLIENT_ID!,
+    client_secret: process.env.GOOGLE_CLIENT_SECRET!,
+    redirect_uris: ['https://example.com/callback'],
+    response_types: ['code']
+  });
+
+  return client;
+}
+
+const oidcClient = await setupOIDC();
+
+// 2. 发起认证
+app.get('/api/auth/oidc/login', async (req, res) => {
+  // 生成安全参数
+  const codeVerifier = generators.codeVerifier();
+  const codeChallenge = generators.codeChallenge(codeVerifier);
+  const state = generators.state();
+  const nonce = generators.nonce();
+
+  // 保存到 Session
+  req.session.oidc = { codeVerifier, state, nonce };
+
+  // 生成授权 URL
+  const authorizationUrl = oidcClient.authorizationUrl({
+    scope: 'openid email profile',
+    code_challenge: codeChallenge,
+    code_challenge_method: 'S256',
+    state,
+    nonce
+  });
+
+  res.redirect(authorizationUrl);
+});
+
+// 3. 处理回调
+app.get('/callback', async (req, res) => {
+  const { codeVerifier, state, nonce } = req.session.oidc;
+
+  // 验证 state
+  if (req.query.state !== state) {
+    return res.status(400).json({ error: 'State mismatch' });
+  }
+
+  try {
+    // 交换 Token
+    const tokenSet = await oidcClient.callback(
+      'https://example.com/callback',
+      req.query,
+      { code_verifier: codeVerifier, state, nonce }
+    );
+
+    // 验证 ID Token
+    const claims = tokenSet.claims();
+    console.log('ID Token claims:', claims);
+    // {
+    //   sub: '1234567890',
+    //   email: 'user@example.com',
+    //   email_verified: true,
+    //   name: 'John Doe',
+    //   picture: 'https://...',
+    //   iat: 1234567890,
+    //   exp: 1234567890,
+    //   nonce: '...'
+    // }
+
+    // 获取用户信息（可选）
+    const userinfo = await oidcClient.userinfo(tokenSet.access_token!);
+    console.log('UserInfo:', userinfo);
+
+    // 创建或更新用户
+    let user = await prisma.user.findUnique({
+      where: { email: claims.email }
+    });
+
+    if (!user) {
+      user = await prisma.user.create({
+        data: {
+          email: claims.email,
+          name: claims.name,
+          avatar: claims.picture,
+          emailVerified: claims.email_verified,
+          googleId: claims.sub
+        }
+      });
+    }
+
+    // 生成应用的 JWT
+    const accessToken = jwtManager.generateAccessToken({
+      userId: user.id,
+      email: user.email,
+      role: user.role
+    });
+
+    // 清除 OIDC Session 数据
+    delete req.session.oidc;
+
+    res.redirect(`${process.env.FRONTEND_URL}/auth/callback?token=${accessToken}`);
+
+  } catch (error) {
+    console.error('OIDC callback error:', error);
+    res.redirect('/login?error=auth_failed');
+  }
+});
+
+// 4. 登出
+app.get('/api/auth/oidc/logout', async (req, res) => {
+  const endSessionUrl = oidcClient.endSessionUrl({
+    post_logout_redirect_uri: 'https://example.com'
+  });
+
+  res.redirect(endSessionUrl);
+});
+```
+
+### OIDC 作为 Provider（自建身份认证服务）
+
+```typescript
+import Provider from 'oidc-provider';
+
+// 配置 OIDC Provider
+const oidc = new Provider('https://auth.example.com', {
+  clients: [{
+    client_id: 'client1',
+    client_secret: 'secret1',
+    redirect_uris: ['https://app.example.com/callback'],
+    grant_types: ['authorization_code', 'refresh_token'],
+    response_types: ['code']
+  }],
+  
+  // 用户查找
+  async findAccount(ctx, id) {
+    const user = await prisma.user.findUnique({ where: { id: parseInt(id) } });
+    if (!user) return undefined;
+    
+    return {
+      accountId: id,
+      async claims(use, scope) {
+        return {
+          sub: id,
+          email: user.email,
+          email_verified: user.emailVerified,
+          name: user.name,
+          picture: user.avatar
+        };
+      }
+    };
+  },
+
+  // Token 存储
+  adapter: new PrismaAdapter(), // 自定义适配器
+
+  // 功能配置
+  features: {
+    devInteractions: { enabled: false },
+    deviceFlow: { enabled: true },
+    introspection: { enabled: true },
+    revocation: { enabled: true }
+  },
+
+  // Cookie 配置
+  cookies: {
+    keys: [process.env.COOKIE_SECRET!]
+  },
+
+  // JWT 配置
+  jwks: {
+    keys: [/* RSA 或 EC 密钥 */]
+  },
+
+  // 声明配置
+  claims: {
+    openid: ['sub'],
+    email: ['email', 'email_verified'],
+    profile: ['name', 'picture']
+  },
+
+  // TTL 配置
+  ttl: {
+    AccessToken: 3600,
+    AuthorizationCode: 600,
+    IdToken: 3600,
+    RefreshToken: 1209600
+  }
+});
+
+// 集成到 Express
+app.use('/oidc', oidc.callback());
+```
+
+---
+
+## OAuth 2.0 PKCE
+
+### PKCE 简介
+
+PKCE（Proof Key for Code Exchange）用于保护 Authorization Code 流程，特别适用于移动应用和 SPA。
+
+```
+问题：Authorization Code 可能被截获
+解决：使用 Code Verifier 和 Code Challenge 绑定请求
+
+流程：
+1. 客户端生成 code_verifier（随机字符串）
+   ↓
+2. 计算 code_challenge = SHA256(code_verifier)
+   ↓
+3. 发送授权请求（带 code_challenge）
+   ↓
+4. 获取 authorization_code
+   ↓
+5. 用 code + code_verifier 换取 token
+   ↓
+6. 服务器验证 SHA256(code_verifier) === code_challenge
+```
+
+### PKCE 实现
+
+```typescript
+import crypto from 'crypto';
+
+class PKCEService {
+  // 生成 Code Verifier（43-128 字符）
+  generateCodeVerifier(): string {
+    return crypto.randomBytes(32)
+      .toString('base64url')
+      .slice(0, 43);
+  }
+
+  // 生成 Code Challenge
+  generateCodeChallenge(verifier: string): string {
+    return crypto
+      .createHash('sha256')
+      .update(verifier)
+      .digest('base64url');
+  }
+
+  // 验证 Code Verifier
+  verifyCodeChallenge(verifier: string, challenge: string): boolean {
+    const computedChallenge = this.generateCodeChallenge(verifier);
+    return crypto.timingSafeEqual(
+      Buffer.from(computedChallenge),
+      Buffer.from(challenge)
+    );
+  }
+}
+
+const pkceService = new PKCEService();
+
+// OAuth 授权端点
+app.get('/oauth/authorize', async (req, res) => {
+  const {
+    client_id,
+    redirect_uri,
+    response_type,
+    scope,
+    state,
+    code_challenge,
+    code_challenge_method
+  } = req.query;
+
+  // 验证客户端
+  const client = await prisma.oauthClient.findUnique({
+    where: { clientId: client_id as string }
+  });
+
+  if (!client || !client.redirectUris.includes(redirect_uri as string)) {
+    return res.status(400).json({ error: 'invalid_client' });
+  }
+
+  // 验证 PKCE（对于公开客户端是必须的）
+  if (client.tokenEndpointAuthMethod === 'none') {
+    if (!code_challenge || code_challenge_method !== 'S256') {
+      return res.status(400).json({
+        error: 'invalid_request',
+        error_description: 'PKCE required for public clients'
+      });
+    }
+  }
+
+  // 渲染授权页面或自动授权
+  res.render('authorize', {
+    client,
+    scope,
+    state,
+    code_challenge,
+    code_challenge_method
+  });
+});
+
+// 用户同意后生成授权码
+app.post('/oauth/authorize', requireAuth, async (req, res) => {
+  const {
+    client_id,
+    redirect_uri,
+    scope,
+    state,
+    code_challenge,
+    code_challenge_method
+  } = req.body;
+
+  // 生成授权码
+  const authorizationCode = crypto.randomBytes(32).toString('hex');
+
+  // 保存授权码（10 分钟过期）
+  await prisma.authorizationCode.create({
+    data: {
+      code: authorizationCode,
+      clientId: client_id,
+      userId: req.user.id,
+      redirectUri: redirect_uri,
+      scope,
+      codeChallenge: code_challenge,
+      codeChallengeMethod: code_challenge_method,
+      expiresAt: new Date(Date.now() + 10 * 60 * 1000)
+    }
+  });
+
+  // 重定向回客户端
+  const params = new URLSearchParams({
+    code: authorizationCode,
+    state
+  });
+
+  res.redirect(`${redirect_uri}?${params}`);
+});
+
+// Token 端点
+app.post('/oauth/token', async (req, res) => {
+  const {
+    grant_type,
+    code,
+    redirect_uri,
+    client_id,
+    client_secret,
+    code_verifier
+  } = req.body;
+
+  if (grant_type !== 'authorization_code') {
+    return res.status(400).json({ error: 'unsupported_grant_type' });
+  }
+
+  // 查找授权码
+  const authCode = await prisma.authorizationCode.findUnique({
+    where: { code },
+    include: { user: true }
+  });
+
+  if (!authCode || authCode.expiresAt < new Date()) {
+    return res.status(400).json({ error: 'invalid_grant' });
+  }
+
+  // 验证客户端
+  const client = await prisma.oauthClient.findUnique({
+    where: { clientId: client_id }
+  });
+
+  if (!client) {
+    return res.status(400).json({ error: 'invalid_client' });
+  }
+
+  // 验证客户端密钥（机密客户端）
+  if (client.tokenEndpointAuthMethod === 'client_secret_post') {
+    if (client.clientSecret !== client_secret) {
+      return res.status(400).json({ error: 'invalid_client' });
+    }
+  }
+
+  // 验证 PKCE
+  if (authCode.codeChallenge) {
+    if (!code_verifier) {
+      return res.status(400).json({
+        error: 'invalid_request',
+        error_description: 'code_verifier required'
+      });
+    }
+
+    const valid = pkceService.verifyCodeChallenge(
+      code_verifier,
+      authCode.codeChallenge
+    );
+
+    if (!valid) {
+      return res.status(400).json({ error: 'invalid_grant' });
+    }
+  }
+
+  // 验证 redirect_uri
+  if (authCode.redirectUri !== redirect_uri) {
+    return res.status(400).json({ error: 'invalid_grant' });
+  }
+
+  // 删除授权码（一次性使用）
+  await prisma.authorizationCode.delete({ where: { code } });
+
+  // 生成 Token
+  const accessToken = jwtManager.generateAccessToken({
+    userId: authCode.user.id,
+    email: authCode.user.email,
+    clientId: client_id,
+    scope: authCode.scope
+  });
+
+  const refreshToken = jwtManager.generateRefreshToken(authCode.user.id);
+
+  res.json({
+    access_token: accessToken,
+    token_type: 'Bearer',
+    expires_in: 3600,
+    refresh_token: refreshToken,
+    scope: authCode.scope
+  });
+});
+```
+
+### 前端 PKCE 流程
+
+```typescript
+class OAuthClient {
+  private clientId: string;
+  private redirectUri: string;
+  private authorizationEndpoint: string;
+  private tokenEndpoint: string;
+
+  constructor(config: OAuthConfig) {
+    this.clientId = config.clientId;
+    this.redirectUri = config.redirectUri;
+    this.authorizationEndpoint = config.authorizationEndpoint;
+    this.tokenEndpoint = config.tokenEndpoint;
+  }
+
+  // 生成 PKCE 参数
+  private async generatePKCE() {
+    const codeVerifier = this.generateRandomString(43);
+    const codeChallenge = await this.sha256(codeVerifier);
+    
+    return { codeVerifier, codeChallenge };
+  }
+
+  private generateRandomString(length: number): string {
+    const array = new Uint8Array(length);
+    crypto.getRandomValues(array);
+    return btoa(String.fromCharCode(...array))
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '')
+      .slice(0, length);
+  }
+
+  private async sha256(plain: string): Promise<string> {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(plain);
+    const hash = await crypto.subtle.digest('SHA-256', data);
+    return btoa(String.fromCharCode(...new Uint8Array(hash)))
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+  }
+
+  // 发起授权
+  async authorize() {
+    const { codeVerifier, codeChallenge } = await this.generatePKCE();
+    const state = this.generateRandomString(32);
+
+    // 保存到 sessionStorage
+    sessionStorage.setItem('oauth_code_verifier', codeVerifier);
+    sessionStorage.setItem('oauth_state', state);
+
+    const params = new URLSearchParams({
+      response_type: 'code',
+      client_id: this.clientId,
+      redirect_uri: this.redirectUri,
+      scope: 'openid email profile',
+      state,
+      code_challenge: codeChallenge,
+      code_challenge_method: 'S256'
+    });
+
+    window.location.href = `${this.authorizationEndpoint}?${params}`;
+  }
+
+  // 处理回调
+  async handleCallback(): Promise<TokenResponse> {
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get('code');
+    const state = params.get('state');
+
+    // 验证 state
+    const savedState = sessionStorage.getItem('oauth_state');
+    if (state !== savedState) {
+      throw new Error('State mismatch');
+    }
+
+    // 获取 code_verifier
+    const codeVerifier = sessionStorage.getItem('oauth_code_verifier');
+    if (!codeVerifier) {
+      throw new Error('Code verifier not found');
+    }
+
+    // 清除存储
+    sessionStorage.removeItem('oauth_state');
+    sessionStorage.removeItem('oauth_code_verifier');
+
+    // 交换 Token
+    const response = await fetch(this.tokenEndpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code: code!,
+        redirect_uri: this.redirectUri,
+        client_id: this.clientId,
+        code_verifier: codeVerifier
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error('Token exchange failed');
+    }
+
+    return response.json();
+  }
+}
+
+// 使用
+const oauthClient = new OAuthClient({
+  clientId: 'my-app',
+  redirectUri: 'https://app.example.com/callback',
+  authorizationEndpoint: 'https://auth.example.com/oauth/authorize',
+  tokenEndpoint: 'https://auth.example.com/oauth/token'
+});
+
+// 登录按钮
+document.getElementById('login').onclick = () => oauthClient.authorize();
+
+// 回调页面
+if (window.location.pathname === '/callback') {
+  oauthClient.handleCallback()
+    .then(tokens => {
+      localStorage.setItem('access_token', tokens.access_token);
+      window.location.href = '/dashboard';
+    })
+    .catch(error => {
+      console.error('OAuth error:', error);
+      window.location.href = '/login?error=auth_failed';
+    });
+}
+```
+
+---
+
 ## 总结
 
 ### 认证方式选择
@@ -1301,8 +2436,11 @@ HMAC-SHA1 算法
 | **Session** | 传统 Web 应用 | ⭐⭐⭐ |
 | **JWT** | SPA、移动应用 | ⭐⭐⭐⭐⭐ |
 | **OAuth 2.0** | 社交登录 | ⭐⭐⭐⭐ |
+| **OIDC** | 企业 SSO、标准化身份认证 | ⭐⭐⭐⭐⭐ |
 | **SSO** | 企业多应用 | ⭐⭐⭐ |
 | **2FA** | 高安全要求 | ⭐⭐⭐⭐ |
+| **WebAuthn** | 无密码、高安全 | ⭐⭐⭐⭐⭐ |
+| **Magic Link** | 简单登录、无密码 | ⭐⭐⭐ |
 
 ### 实践检查清单
 
@@ -1316,6 +2454,46 @@ HMAC-SHA1 算法
 - [ ] 是否记录登录日志？
 - [ ] 是否有异常登录检测？
 - [ ] 是否定期更新密钥？
+- [ ] 是否考虑 WebAuthn 无密码认证？
+- [ ] 是否使用 PKCE 保护 OAuth 流程？
+- [ ] 是否支持 OIDC 标准？
+
+### 高级认证面试题
+
+#### 6. WebAuthn 的优势是什么？
+
+**优势**：
+- 🔐 **抗钓鱼**：基于域名绑定，无法在假冒网站使用
+- 🚀 **无密码**：使用生物识别或硬件密钥
+- 💪 **高安全**：私钥永不离开设备
+- ⚡ **便捷**：指纹/Face ID 一触即登
+
+**挑战**：
+- 浏览器兼容性
+- 用户设备支持
+- 恢复流程设计
+
+#### 7. PKCE 解决什么问题？
+
+**问题**：Authorization Code 可能被截获（特别是移动/SPA 应用）
+
+**解决方案**：
+1. 客户端生成 `code_verifier`（随机字符串）
+2. 计算 `code_challenge = SHA256(code_verifier)`
+3. 授权请求携带 `code_challenge`
+4. Token 请求携带 `code_verifier`
+5. 服务器验证两者匹配
+
+**适用场景**：所有公开客户端（移动应用、SPA）
+
+#### 8. OIDC vs OAuth 2.0？
+
+| 特性 | OAuth 2.0 | OIDC |
+|------|-----------|------|
+| **目的** | 授权 | 认证 + 授权 |
+| **Token** | Access Token | Access Token + ID Token |
+| **用户信息** | 自定义 | 标准化 UserInfo |
+| **发现** | 无 | Discovery 端点 |
 
 ---
 

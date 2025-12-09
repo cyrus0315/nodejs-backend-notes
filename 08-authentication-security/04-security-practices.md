@@ -1257,6 +1257,1164 @@ sqlmap -u "https://example.com/api/users?id=1" --batch
 
 ---
 
+## 安全合规
+
+### GDPR（通用数据保护条例）
+
+欧盟的数据保护法规，适用于处理欧盟居民个人数据的组织。
+
+```typescript
+// GDPR 核心要求实现
+
+// 1. 数据主体权利 - 访问权
+app.get('/api/gdpr/my-data', requireAuth, async (req, res) => {
+  const userId = req.user.id;
+
+  // 收集用户所有数据
+  const userData = {
+    profile: await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        email: true,
+        name: true,
+        phone: true,
+        createdAt: true,
+        updatedAt: true
+      }
+    }),
+    posts: await prisma.post.findMany({
+      where: { authorId: userId }
+    }),
+    comments: await prisma.comment.findMany({
+      where: { userId }
+    }),
+    orders: await prisma.order.findMany({
+      where: { userId }
+    }),
+    activityLogs: await prisma.activityLog.findMany({
+      where: { userId },
+      take: 1000 // 限制数量
+    })
+  };
+
+  // 记录数据访问请求
+  await prisma.gdprRequest.create({
+    data: {
+      userId,
+      type: 'ACCESS',
+      status: 'COMPLETED',
+      completedAt: new Date()
+    }
+  });
+
+  res.json(userData);
+});
+
+// 2. 数据主体权利 - 删除权（被遗忘权）
+app.post('/api/gdpr/delete-account', requireAuth, async (req, res) => {
+  const userId = req.user.id;
+
+  // 创建删除请求
+  const request = await prisma.gdprRequest.create({
+    data: {
+      userId,
+      type: 'DELETION',
+      status: 'PENDING'
+    }
+  });
+
+  // 异步处理删除（可能需要人工审核）
+  await gdprDeletionQueue.add('deleteUserData', {
+    requestId: request.id,
+    userId
+  });
+
+  res.json({
+    message: 'Deletion request received',
+    requestId: request.id,
+    estimatedCompletion: '30 days'
+  });
+});
+
+// 数据删除处理器
+async function processUserDeletion(userId: number) {
+  // 1. 匿名化而非删除（保留业务数据完整性）
+  await prisma.user.update({
+    where: { id: userId },
+    data: {
+      email: `deleted_${userId}@anonymized.local`,
+      name: 'Deleted User',
+      phone: null,
+      avatar: null,
+      isDeleted: true,
+      deletedAt: new Date()
+    }
+  });
+
+  // 2. 删除可识别的关联数据
+  await prisma.activityLog.deleteMany({
+    where: { userId }
+  });
+
+  // 3. 匿名化评论（保留内容但移除身份）
+  await prisma.comment.updateMany({
+    where: { userId },
+    data: { authorName: 'Anonymous' }
+  });
+
+  // 4. 记录删除操作
+  await prisma.gdprAuditLog.create({
+    data: {
+      action: 'USER_DELETION',
+      userId,
+      timestamp: new Date(),
+      details: {
+        anonymizedTables: ['user', 'comment'],
+        deletedTables: ['activityLog']
+      }
+    }
+  });
+}
+
+// 3. 数据主体权利 - 数据可携带权
+app.get('/api/gdpr/export', requireAuth, async (req, res) => {
+  const userId = req.user.id;
+
+  // 收集所有数据
+  const exportData = await collectUserData(userId);
+
+  // 生成 JSON 文件
+  const filename = `user_data_${userId}_${Date.now()}.json`;
+  const filepath = `/tmp/${filename}`;
+  
+  await fs.promises.writeFile(
+    filepath,
+    JSON.stringify(exportData, null, 2)
+  );
+
+  // 发送下载链接邮件
+  await sendEmail(req.user.email, {
+    subject: 'Your Data Export is Ready',
+    template: 'gdpr-export',
+    data: {
+      downloadLink: `${process.env.APP_URL}/downloads/${filename}`,
+      expiresIn: '7 days'
+    }
+  });
+
+  res.json({ message: 'Export started, you will receive an email' });
+});
+
+// 4. 数据最小化
+const UserCreateSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(8),
+  name: z.string().min(1).max(100),
+  // 只收集必要数据
+  // phone: z.string().optional(), // 不强制收集
+  // birthdate: z.date().optional(), // 不强制收集
+  marketingConsent: z.boolean().default(false)
+});
+
+// 5. 同意管理
+interface ConsentRecord {
+  userId: number;
+  type: 'marketing' | 'analytics' | 'personalization';
+  granted: boolean;
+  timestamp: Date;
+  ipAddress: string;
+  userAgent: string;
+}
+
+app.post('/api/consent', requireAuth, async (req, res) => {
+  const { consents } = req.body;
+
+  for (const consent of consents) {
+    await prisma.consent.upsert({
+      where: {
+        userId_type: {
+          userId: req.user.id,
+          type: consent.type
+        }
+      },
+      update: {
+        granted: consent.granted,
+        timestamp: new Date(),
+        ipAddress: req.ip,
+        userAgent: req.headers['user-agent']
+      },
+      create: {
+        userId: req.user.id,
+        type: consent.type,
+        granted: consent.granted,
+        timestamp: new Date(),
+        ipAddress: req.ip,
+        userAgent: req.headers['user-agent']
+      }
+    });
+  }
+
+  res.json({ message: 'Consent preferences saved' });
+});
+
+// 6. 数据泄露通知
+async function handleDataBreach(breach: DataBreach) {
+  // 72 小时内通知监管机构
+  await notifyRegulator(breach);
+
+  // 通知受影响用户
+  const affectedUsers = await getAffectedUsers(breach);
+  
+  for (const user of affectedUsers) {
+    await sendEmail(user.email, {
+      subject: 'Important Security Notice',
+      template: 'data-breach',
+      data: {
+        breachDate: breach.discoveredAt,
+        affectedData: breach.dataTypes,
+        actionsTaken: breach.remediation,
+        recommendations: breach.userRecommendations
+      }
+    });
+  }
+
+  // 记录通知
+  await prisma.dataBreachNotification.create({
+    data: {
+      breachId: breach.id,
+      notifiedAt: new Date(),
+      affectedUserCount: affectedUsers.length
+    }
+  });
+}
+```
+
+### PCI DSS（支付卡行业数据安全标准）
+
+处理信用卡数据必须遵守的安全标准。
+
+```typescript
+// PCI DSS 核心要求实现
+
+// 1. 不存储敏感认证数据
+// ❌ 错误
+interface PaymentData {
+  cardNumber: string;  // 完整卡号
+  cvv: string;         // CVV 不能存储！
+  pin: string;         // PIN 不能存储！
+}
+
+// ✅ 正确：使用 Token
+interface PaymentToken {
+  tokenId: string;        // 支付网关返回的 Token
+  lastFour: string;       // 只存最后 4 位
+  cardBrand: string;      // Visa, Mastercard
+  expiryMonth: number;
+  expiryYear: number;
+}
+
+// 2. 使用支付网关（Stripe）
+import Stripe from 'stripe';
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
+
+app.post('/api/payments/method', requireAuth, async (req, res) => {
+  const { paymentMethodId } = req.body;
+
+  // Stripe 处理敏感数据，我们只存 Token
+  const paymentMethod = await stripe.paymentMethods.retrieve(paymentMethodId);
+
+  await prisma.paymentMethod.create({
+    data: {
+      userId: req.user.id,
+      stripePaymentMethodId: paymentMethodId,
+      cardBrand: paymentMethod.card?.brand,
+      lastFour: paymentMethod.card?.last4,
+      expiryMonth: paymentMethod.card?.exp_month,
+      expiryYear: paymentMethod.card?.exp_year
+    }
+  });
+
+  res.json({ message: 'Payment method saved' });
+});
+
+// 3. 加密传输中的数据
+// 强制 HTTPS，配置强 TLS
+const tlsConfig = {
+  minVersion: 'TLSv1.2',
+  cipherSuites: [
+    'TLS_AES_256_GCM_SHA384',
+    'TLS_CHACHA20_POLY1305_SHA256',
+    'TLS_AES_128_GCM_SHA256'
+  ]
+};
+
+// 4. 访问控制
+const pciRoles = {
+  payment_admin: ['view_transactions', 'refund', 'void'],
+  payment_viewer: ['view_transactions'],
+  developer: [] // 开发者不能访问生产支付数据
+};
+
+function requirePCIPermission(permission: string) {
+  return async (req, res, next) => {
+    const userPermissions = pciRoles[req.user.pciRole] || [];
+    
+    if (!userPermissions.includes(permission)) {
+      // 记录访问尝试
+      await logPCIAccess(req.user.id, permission, false);
+      return res.status(403).json({ error: 'PCI access denied' });
+    }
+
+    await logPCIAccess(req.user.id, permission, true);
+    next();
+  };
+}
+
+// 5. 审计日志
+async function logPCIAccess(
+  userId: number,
+  action: string,
+  success: boolean
+) {
+  await prisma.pciAuditLog.create({
+    data: {
+      userId,
+      action,
+      success,
+      timestamp: new Date(),
+      ipAddress: getCurrentIP(),
+      // PCI 要求保留日志至少 1 年
+      expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000)
+    }
+  });
+}
+
+// 6. 定期安全评估
+interface PCIComplianceCheck {
+  requirement: string;
+  status: 'compliant' | 'non-compliant' | 'not-applicable';
+  lastChecked: Date;
+  notes: string;
+}
+
+async function runPCIComplianceCheck(): Promise<PCIComplianceCheck[]> {
+  return [
+    {
+      requirement: '3.2 - Do not store CVV',
+      status: await checkCVVStorage() ? 'non-compliant' : 'compliant',
+      lastChecked: new Date(),
+      notes: 'Automated scan of database'
+    },
+    {
+      requirement: '6.5 - Secure coding',
+      status: await checkSecureCoding() ? 'compliant' : 'non-compliant',
+      lastChecked: new Date(),
+      notes: 'SAST scan results'
+    },
+    {
+      requirement: '8.2 - Strong authentication',
+      status: await checkAuthStrength() ? 'compliant' : 'non-compliant',
+      lastChecked: new Date(),
+      notes: 'Password policy check'
+    }
+  ];
+}
+```
+
+### SOC 2（服务组织控制）
+
+针对 SaaS 服务提供商的安全、可用性、处理完整性、保密性和隐私的审计标准。
+
+```typescript
+// SOC 2 合规实现
+
+// 1. 安全性 - 变更管理
+interface ChangeRequest {
+  id: string;
+  type: 'code' | 'infrastructure' | 'configuration';
+  description: string;
+  requestedBy: string;
+  reviewedBy: string | null;
+  approvedBy: string | null;
+  status: 'pending' | 'approved' | 'rejected' | 'deployed';
+  riskAssessment: 'low' | 'medium' | 'high';
+  rollbackPlan: string;
+  createdAt: Date;
+  deployedAt: Date | null;
+}
+
+class ChangeManagement {
+  async requestChange(request: Omit<ChangeRequest, 'id' | 'status' | 'createdAt'>): Promise<ChangeRequest> {
+    const change = await prisma.changeRequest.create({
+      data: {
+        ...request,
+        status: 'pending',
+        createdAt: new Date()
+      }
+    });
+
+    // 高风险变更需要额外审批
+    if (request.riskAssessment === 'high') {
+      await notifySecurityTeam(change);
+    }
+
+    return change;
+  }
+
+  async approveChange(changeId: string, approverId: string): Promise<void> {
+    const change = await prisma.changeRequest.findUnique({
+      where: { id: changeId }
+    });
+
+    // 审批者不能是请求者
+    if (change?.requestedBy === approverId) {
+      throw new Error('Cannot approve own change request');
+    }
+
+    await prisma.changeRequest.update({
+      where: { id: changeId },
+      data: {
+        approvedBy: approverId,
+        status: 'approved'
+      }
+    });
+  }
+}
+
+// 2. 可用性 - SLA 监控
+interface SLAMetric {
+  name: string;
+  target: number;
+  actual: number;
+  period: 'daily' | 'monthly' | 'yearly';
+}
+
+class SLAMonitor {
+  async calculateUptime(startDate: Date, endDate: Date): Promise<number> {
+    const incidents = await prisma.incident.findMany({
+      where: {
+        startedAt: { gte: startDate },
+        resolvedAt: { lte: endDate }
+      }
+    });
+
+    const totalMinutes = (endDate.getTime() - startDate.getTime()) / 60000;
+    const downtimeMinutes = incidents.reduce(
+      (sum, inc) => sum + (inc.resolvedAt!.getTime() - inc.startedAt.getTime()) / 60000,
+      0
+    );
+
+    return ((totalMinutes - downtimeMinutes) / totalMinutes) * 100;
+  }
+
+  async generateSLAReport(month: Date): Promise<SLAMetric[]> {
+    const startDate = new Date(month.getFullYear(), month.getMonth(), 1);
+    const endDate = new Date(month.getFullYear(), month.getMonth() + 1, 0);
+
+    return [
+      {
+        name: 'Uptime',
+        target: 99.9,
+        actual: await this.calculateUptime(startDate, endDate),
+        period: 'monthly'
+      },
+      {
+        name: 'Response Time P95',
+        target: 200,
+        actual: await this.calculateP95ResponseTime(startDate, endDate),
+        period: 'monthly'
+      },
+      {
+        name: 'Error Rate',
+        target: 0.1,
+        actual: await this.calculateErrorRate(startDate, endDate),
+        period: 'monthly'
+      }
+    ];
+  }
+}
+
+// 3. 处理完整性 - 数据验证
+class DataIntegrity {
+  async validateTransaction(transactionId: string): Promise<boolean> {
+    const transaction = await prisma.transaction.findUnique({
+      where: { id: transactionId },
+      include: { items: true }
+    });
+
+    if (!transaction) return false;
+
+    // 验证金额
+    const calculatedTotal = transaction.items.reduce(
+      (sum, item) => sum + item.quantity * item.price,
+      0
+    );
+
+    if (Math.abs(calculatedTotal - transaction.total) > 0.01) {
+      await this.logIntegrityViolation(transactionId, 'amount_mismatch');
+      return false;
+    }
+
+    // 验证哈希
+    const expectedHash = this.calculateHash(transaction);
+    if (expectedHash !== transaction.integrityHash) {
+      await this.logIntegrityViolation(transactionId, 'hash_mismatch');
+      return false;
+    }
+
+    return true;
+  }
+
+  private calculateHash(data: any): string {
+    return crypto
+      .createHash('sha256')
+      .update(JSON.stringify(data))
+      .digest('hex');
+  }
+}
+
+// 4. 保密性 - 数据分类
+enum DataClassification {
+  PUBLIC = 'public',
+  INTERNAL = 'internal',
+  CONFIDENTIAL = 'confidential',
+  RESTRICTED = 'restricted'
+}
+
+const classificationRules: Record<DataClassification, {
+  encryption: boolean;
+  accessLogging: boolean;
+  retention: number; // days
+}> = {
+  [DataClassification.PUBLIC]: {
+    encryption: false,
+    accessLogging: false,
+    retention: 365
+  },
+  [DataClassification.INTERNAL]: {
+    encryption: true,
+    accessLogging: false,
+    retention: 365
+  },
+  [DataClassification.CONFIDENTIAL]: {
+    encryption: true,
+    accessLogging: true,
+    retention: 2555 // 7 years
+  },
+  [DataClassification.RESTRICTED]: {
+    encryption: true,
+    accessLogging: true,
+    retention: 2555
+  }
+};
+
+// 5. 隐私 - 数据保护影响评估（DPIA）
+interface DPIA {
+  projectName: string;
+  dataTypes: string[];
+  purposes: string[];
+  risks: Risk[];
+  mitigations: Mitigation[];
+  approvedBy: string;
+  approvedAt: Date;
+}
+
+interface Risk {
+  description: string;
+  likelihood: 'low' | 'medium' | 'high';
+  impact: 'low' | 'medium' | 'high';
+  overallRisk: 'low' | 'medium' | 'high';
+}
+```
+
+---
+
+## DevSecOps
+
+### 安全左移（Shift Left Security）
+
+将安全集成到开发流程的每个阶段。
+
+```yaml
+# .github/workflows/security.yml
+name: Security Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # 1. 静态代码分析（SAST）
+  sast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Run ESLint Security Plugin
+        run: |
+          npm ci
+          npx eslint --ext .ts,.js src/ --config .eslintrc.security.js
+      
+      - name: Run Semgrep
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/security-audit
+            p/secrets
+            p/nodejs
+      
+      - name: Run CodeQL
+        uses: github/codeql-action/analyze@v2
+        with:
+          languages: javascript
+
+  # 2. 依赖漏洞扫描（SCA）
+  dependency-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: npm audit
+        run: npm audit --audit-level=moderate
+      
+      - name: Snyk Scan
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      
+      - name: OWASP Dependency-Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          path: '.'
+          format: 'HTML'
+          out: 'reports'
+
+  # 3. 密钥扫描
+  secrets-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      
+      - name: GitLeaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: TruffleHog
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: main
+          head: HEAD
+
+  # 4. 容器安全扫描
+  container-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Build Docker image
+        run: docker build -t myapp:${{ github.sha }} .
+      
+      - name: Trivy Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: myapp:${{ github.sha }}
+          format: 'table'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+      
+      - name: Snyk Container
+        uses: snyk/actions/docker@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          image: myapp:${{ github.sha }}
+
+  # 5. 基础设施即代码扫描
+  iac-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: terraform/
+          framework: terraform
+      
+      - name: tfsec
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          working_directory: terraform/
+
+  # 6. 动态安全测试（DAST）
+  dast:
+    runs-on: ubuntu-latest
+    needs: [sast, dependency-scan]
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Start Application
+        run: |
+          docker-compose up -d
+          sleep 30
+      
+      - name: OWASP ZAP Scan
+        uses: zaproxy/action-full-scan@v0.7.0
+        with:
+          target: 'http://localhost:3000'
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-a'
+```
+
+### Pre-commit 安全钩子
+
+```yaml
+# .pre-commit-config.yaml
+repos:
+  # 密钥扫描
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.0
+    hooks:
+      - id: gitleaks
+
+  # 安全 Lint
+  - repo: local
+    hooks:
+      - id: eslint-security
+        name: ESLint Security
+        entry: npx eslint --config .eslintrc.security.js
+        language: system
+        types: [javascript, typescript]
+
+  # 依赖检查
+  - repo: local
+    hooks:
+      - id: npm-audit
+        name: npm audit
+        entry: npm audit --audit-level=high
+        language: system
+        pass_filenames: false
+
+  # Dockerfile 检查
+  - repo: https://github.com/hadolint/hadolint
+    rev: v2.12.0
+    hooks:
+      - id: hadolint
+```
+
+### 安全测试自动化
+
+```typescript
+// security.test.ts
+import request from 'supertest';
+import app from '../src/app';
+
+describe('Security Tests', () => {
+  describe('Authentication', () => {
+    it('should reject requests without token', async () => {
+      const response = await request(app)
+        .get('/api/protected')
+        .expect(401);
+
+      expect(response.body.error).toBe('No token provided');
+    });
+
+    it('should reject invalid tokens', async () => {
+      const response = await request(app)
+        .get('/api/protected')
+        .set('Authorization', 'Bearer invalid_token')
+        .expect(401);
+
+      expect(response.body.error).toBe('Invalid token');
+    });
+
+    it('should rate limit login attempts', async () => {
+      const credentials = { email: 'test@test.com', password: 'wrong' };
+
+      // 尝试 6 次
+      for (let i = 0; i < 6; i++) {
+        await request(app).post('/api/login').send(credentials);
+      }
+
+      const response = await request(app)
+        .post('/api/login')
+        .send(credentials)
+        .expect(429);
+
+      expect(response.body.error).toContain('Too many');
+    });
+  });
+
+  describe('Injection Prevention', () => {
+    it('should prevent SQL injection', async () => {
+      const response = await request(app)
+        .get('/api/users')
+        .query({ search: "'; DROP TABLE users; --" })
+        .set('Authorization', `Bearer ${validToken}`)
+        .expect(200);
+
+      // 应该返回空结果而不是错误
+      expect(Array.isArray(response.body)).toBe(true);
+    });
+
+    it('should prevent NoSQL injection', async () => {
+      const response = await request(app)
+        .post('/api/login')
+        .send({
+          email: { $ne: null },
+          password: { $ne: null }
+        })
+        .expect(400);
+    });
+
+    it('should escape XSS in output', async () => {
+      const maliciousScript = '<script>alert("XSS")</script>';
+      
+      // 创建带有恶意脚本的内容
+      await request(app)
+        .post('/api/posts')
+        .set('Authorization', `Bearer ${validToken}`)
+        .send({ title: 'Test', content: maliciousScript });
+
+      // 读取内容
+      const response = await request(app)
+        .get('/api/posts/1')
+        .set('Authorization', `Bearer ${validToken}`);
+
+      // 应该被转义
+      expect(response.body.content).not.toContain('<script>');
+    });
+  });
+
+  describe('Security Headers', () => {
+    it('should set security headers', async () => {
+      const response = await request(app).get('/');
+
+      expect(response.headers['x-frame-options']).toBe('DENY');
+      expect(response.headers['x-content-type-options']).toBe('nosniff');
+      expect(response.headers['x-xss-protection']).toBe('1; mode=block');
+      expect(response.headers['strict-transport-security']).toBeDefined();
+      expect(response.headers['content-security-policy']).toBeDefined();
+    });
+  });
+
+  describe('CSRF Protection', () => {
+    it('should reject requests without CSRF token', async () => {
+      const response = await request(app)
+        .post('/api/transfer')
+        .set('Authorization', `Bearer ${validToken}`)
+        .send({ to: 'attacker', amount: 1000 })
+        .expect(403);
+
+      expect(response.body.error).toContain('CSRF');
+    });
+  });
+
+  describe('Authorization', () => {
+    it('should prevent unauthorized access to admin routes', async () => {
+      const response = await request(app)
+        .get('/api/admin/users')
+        .set('Authorization', `Bearer ${userToken}`) // 普通用户
+        .expect(403);
+    });
+
+    it('should prevent access to other users resources', async () => {
+      const response = await request(app)
+        .get('/api/users/999/private-data')
+        .set('Authorization', `Bearer ${userToken}`) // userId = 1
+        .expect(403);
+    });
+  });
+});
+```
+
+---
+
+## 安全事件响应
+
+### 事件响应计划
+
+```typescript
+// 安全事件分类
+enum IncidentSeverity {
+  CRITICAL = 'critical', // 数据泄露、系统被入侵
+  HIGH = 'high',         // 严重漏洞被利用
+  MEDIUM = 'medium',     // 可疑活动、轻微漏洞
+  LOW = 'low'            // 策略违反、异常行为
+}
+
+interface SecurityIncident {
+  id: string;
+  severity: IncidentSeverity;
+  type: string;
+  description: string;
+  detectedAt: Date;
+  detectedBy: 'automated' | 'manual' | 'external';
+  status: 'detected' | 'analyzing' | 'containing' | 'eradicating' | 'recovering' | 'closed';
+  assignedTo: string[];
+  affectedSystems: string[];
+  affectedUsers: number;
+  timeline: IncidentEvent[];
+}
+
+interface IncidentEvent {
+  timestamp: Date;
+  action: string;
+  performedBy: string;
+  details: string;
+}
+
+// 事件响应服务
+class IncidentResponseService {
+  // 检测到事件
+  async detectIncident(data: Partial<SecurityIncident>): Promise<SecurityIncident> {
+    const incident = await prisma.securityIncident.create({
+      data: {
+        ...data,
+        status: 'detected',
+        detectedAt: new Date()
+      }
+    });
+
+    // 根据严重性触发响应
+    await this.triggerResponse(incident);
+
+    return incident;
+  }
+
+  // 触发响应
+  private async triggerResponse(incident: SecurityIncident): Promise<void> {
+    switch (incident.severity) {
+      case IncidentSeverity.CRITICAL:
+        // 立即通知所有相关人员
+        await this.notifySecurityTeam(incident, 'immediate');
+        await this.notifyManagement(incident);
+        await this.notifyLegal(incident);
+        
+        // 自动隔离措施
+        await this.initiateContainment(incident);
+        break;
+
+      case IncidentSeverity.HIGH:
+        await this.notifySecurityTeam(incident, 'urgent');
+        break;
+
+      case IncidentSeverity.MEDIUM:
+        await this.notifySecurityTeam(incident, 'normal');
+        break;
+
+      case IncidentSeverity.LOW:
+        // 记录并稍后处理
+        await this.queueForReview(incident);
+        break;
+    }
+
+    // 添加到时间线
+    await this.addTimelineEvent(incident.id, {
+      action: 'Response triggered',
+      details: `Severity: ${incident.severity}`
+    });
+  }
+
+  // 遏制阶段
+  async containIncident(incidentId: string, actions: string[]): Promise<void> {
+    const incident = await this.getIncident(incidentId);
+
+    for (const action of actions) {
+      switch (action) {
+        case 'block_ip':
+          await this.blockSuspiciousIPs(incident);
+          break;
+        case 'revoke_tokens':
+          await this.revokeAffectedTokens(incident);
+          break;
+        case 'disable_accounts':
+          await this.disableCompromisedAccounts(incident);
+          break;
+        case 'isolate_system':
+          await this.isolateAffectedSystems(incident);
+          break;
+      }
+
+      await this.addTimelineEvent(incidentId, {
+        action: 'Containment action',
+        details: action
+      });
+    }
+
+    await this.updateStatus(incidentId, 'containing');
+  }
+
+  // 根除阶段
+  async eradicateThreat(incidentId: string, measures: string[]): Promise<void> {
+    for (const measure of measures) {
+      await this.addTimelineEvent(incidentId, {
+        action: 'Eradication measure',
+        details: measure
+      });
+    }
+
+    await this.updateStatus(incidentId, 'eradicating');
+  }
+
+  // 恢复阶段
+  async recoverSystems(incidentId: string): Promise<void> {
+    const incident = await this.getIncident(incidentId);
+
+    // 恢复受影响的系统
+    for (const system of incident.affectedSystems) {
+      await this.restoreSystem(system);
+    }
+
+    // 重新启用账户
+    await this.reEnableAccounts(incident);
+
+    // 移除临时封锁
+    await this.removeTemporaryBlocks(incident);
+
+    await this.updateStatus(incidentId, 'recovering');
+  }
+
+  // 关闭事件
+  async closeIncident(incidentId: string, postMortem: PostMortem): Promise<void> {
+    await prisma.securityIncident.update({
+      where: { id: incidentId },
+      data: {
+        status: 'closed',
+        closedAt: new Date(),
+        postMortemId: postMortem.id
+      }
+    });
+
+    // 归档相关日志
+    await this.archiveIncidentLogs(incidentId);
+
+    // 更新安全策略（如果需要）
+    if (postMortem.policyUpdates.length > 0) {
+      await this.schedulePolicyUpdates(postMortem.policyUpdates);
+    }
+  }
+
+  // 自动检测
+  async runAutomatedDetection(): Promise<void> {
+    // 检测暴力破解
+    const bruteForceAttempts = await this.detectBruteForce();
+    for (const attempt of bruteForceAttempts) {
+      await this.detectIncident({
+        severity: IncidentSeverity.MEDIUM,
+        type: 'brute_force',
+        description: `Brute force attack detected from ${attempt.ip}`,
+        detectedBy: 'automated',
+        affectedSystems: ['auth-service']
+      });
+    }
+
+    // 检测异常登录
+    const anomalousLogins = await this.detectAnomalousLogins();
+    for (const login of anomalousLogins) {
+      await this.detectIncident({
+        severity: IncidentSeverity.MEDIUM,
+        type: 'anomalous_login',
+        description: `Anomalous login for user ${login.userId}`,
+        detectedBy: 'automated',
+        affectedUsers: 1
+      });
+    }
+
+    // 检测数据外泄
+    const dataExfiltration = await this.detectDataExfiltration();
+    if (dataExfiltration) {
+      await this.detectIncident({
+        severity: IncidentSeverity.CRITICAL,
+        type: 'data_exfiltration',
+        description: 'Potential data exfiltration detected',
+        detectedBy: 'automated',
+        affectedSystems: dataExfiltration.systems
+      });
+    }
+  }
+
+  private async detectBruteForce(): Promise<{ ip: string; attempts: number }[]> {
+    const threshold = 10;
+    const window = 15 * 60 * 1000; // 15 分钟
+
+    const recentFailures = await prisma.loginAttempt.groupBy({
+      by: ['ip'],
+      where: {
+        success: false,
+        timestamp: { gte: new Date(Date.now() - window) }
+      },
+      _count: { ip: true },
+      having: {
+        ip: { _count: { gte: threshold } }
+      }
+    });
+
+    return recentFailures.map(r => ({
+      ip: r.ip,
+      attempts: r._count.ip
+    }));
+  }
+
+  private async detectAnomalousLogins(): Promise<{ userId: number; reason: string }[]> {
+    // 检测新位置登录
+    // 检测新设备登录
+    // 检测异常时间登录
+    // 这里简化实现
+    return [];
+  }
+
+  private async detectDataExfiltration(): Promise<{ systems: string[] } | null> {
+    // 检测大量数据导出
+    // 检测异常 API 调用模式
+    // 这里简化实现
+    return null;
+  }
+}
+
+// 事后分析报告
+interface PostMortem {
+  id: string;
+  incidentId: string;
+  summary: string;
+  rootCause: string;
+  timeline: string;
+  impact: {
+    usersAffected: number;
+    dataCompromised: string[];
+    financialImpact: number;
+    reputationalImpact: 'low' | 'medium' | 'high';
+  };
+  lessonsLearned: string[];
+  actionItems: ActionItem[];
+  policyUpdates: string[];
+}
+
+interface ActionItem {
+  description: string;
+  assignee: string;
+  dueDate: Date;
+  priority: 'high' | 'medium' | 'low';
+  status: 'pending' | 'in_progress' | 'completed';
+}
+
+// 定期运行检测
+const incidentResponse = new IncidentResponseService();
+setInterval(() => {
+  incidentResponse.runAutomatedDetection();
+}, 5 * 60 * 1000); // 每 5 分钟
+```
+
+---
+
 ## 总结
 
 ### 安全实践优先级
@@ -1267,6 +2425,7 @@ sqlmap -u "https://example.com/api/users?id=1" --batch
 | **P1（重要）** | 速率限制、CORS、安全响应头 | ⭐⭐ | ⭐⭐⭐⭐ |
 | **P2（推荐）** | 日志监控、依赖扫描、审计 | ⭐⭐⭐ | ⭐⭐⭐ |
 | **P3（加分）** | 渗透测试、WAF、DDoS 防护 | ⭐⭐⭐⭐ | ⭐⭐⭐ |
+| **P4（企业级）** | 安全合规、DevSecOps、事件响应 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ |
 
 ### 实践路线图
 
@@ -1293,6 +2452,56 @@ sqlmap -u "https://example.com/api/users?id=1" --batch
 - [ ] 容器安全
 - [ ] 渗透测试
 - [ ] 灾难恢复计划
+
+**第 5 周**：DevSecOps
+- [ ] SAST 集成
+- [ ] SCA 集成
+- [ ] 密钥扫描
+- [ ] 安全 CI/CD
+
+**第 6 周**：合规与响应
+- [ ] GDPR 合规检查
+- [ ] 事件响应计划
+- [ ] 安全培训
+- [ ] 定期审计
+
+### 高级面试题
+
+#### 6. DevSecOps 包含哪些实践？
+
+**核心实践**：
+
+| 阶段 | 工具/实践 |
+|------|----------|
+| **计划** | 威胁建模、安全需求 |
+| **开发** | 安全编码培训、IDE 插件 |
+| **构建** | SAST、SCA、密钥扫描 |
+| **测试** | DAST、渗透测试、安全测试 |
+| **部署** | IaC 扫描、容器扫描 |
+| **运行** | RASP、WAF、监控 |
+| **监控** | SIEM、异常检测 |
+
+#### 7. 如何实现 GDPR 合规？
+
+**核心要求**：
+
+1. **同意管理**：明确获取用户同意
+2. **数据权利**：访问、删除、可携带
+3. **数据最小化**：只收集必要数据
+4. **安全保护**：加密、访问控制
+5. **泄露通知**：72 小时内通知
+6. **隐私设计**：Privacy by Design
+
+#### 8. 安全事件响应流程？
+
+**6 个阶段**：
+
+1. **准备**：建立团队、工具、流程
+2. **检测**：监控、告警、分析
+3. **遏制**：隔离、阻断
+4. **根除**：清除威胁、修复漏洞
+5. **恢复**：恢复服务、监控
+6. **总结**：事后分析、改进
 
 ---
 
